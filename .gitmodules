@@ -1,0 +1,9 @@
+[submodule "deps/whisper.cpp"]
+	path = deps/whisper.cpp
+	url = https://github.com/ggml-org/whisper.cpp.git
+[submodule "deps/llama.cpp"]
+	path = deps/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "deps/lemonade"]
+	path = deps/lemonade
+	url = https://github.com/lemonade-sdk/lemonade.git

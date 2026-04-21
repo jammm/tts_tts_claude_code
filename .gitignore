@@ -1,0 +1,36 @@
+# Python virtual env — recreated from requirements.txt
+.venv/
+.venv-*/
+
+# Build outputs & downloaded artifacts — recreated from tools/build_*.cmd
+vendor/
+
+# Submodule build trees (transient)
+deps/*/build/
+deps/*/build-*/
+deps/*/build_*/
+
+# Scratch test scripts and generated WAVs
+tmp/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor / tool caches
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+
+# Audio test artifacts
+*.wav
+
+# Logs
+*.log
+
+# OS cruft
+Thumbs.db
+.DS_Store

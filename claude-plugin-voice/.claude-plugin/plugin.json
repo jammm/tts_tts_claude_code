@@ -1,0 +1,6 @@
+{
+  "name": "voice",
+  "version": "0.1.0",
+  "description": "Local TTS for Claude responses (Stop hook) + /voice:speak slash command. Pairs with the host PTT daemon for STT.",
+  "author": { "name": "jam" }
+}

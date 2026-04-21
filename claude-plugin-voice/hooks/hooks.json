@@ -1,0 +1,14 @@
+{
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "shell": "powershell",
+          "command": "& \"__VENV_PYTHON__\" \"${CLAUDE_PLUGIN_DIR}/scripts/speak.py\" --from-hook"
+        }
+      ]
+    }
+  ]
+}

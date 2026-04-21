@@ -1,0 +1,8 @@
+lemonade-sdk==9.1.4
+pynput==1.8.1
+sounddevice==0.5.5
+numpy==2.4.4
+requests==2.33.1
+pyautogui==0.9.54
+soundfile==0.13.1
+openwakeword==0.6.0

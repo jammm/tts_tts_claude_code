@@ -6,4 +6,8 @@
 	url = https://github.com/ggml-org/llama.cpp.git
 [submodule "deps/lemonade"]
 	path = deps/lemonade
-	url = https://github.com/lemonade-sdk/lemonade.git
+	url = https://github.com/jammm/lemonade.git
+	# Our fork of lemonade-sdk/lemonade. The default branch tracks
+	# upstream, but the main-repo submodule pointer resolves to our
+	# jam/windows-rocm-whisper branch which adds a rocm backend for
+	# whispercpp (see Build / runtime notes in README.md).

@@ -6,6 +6,7 @@ Local TTS + STT + wake-word for [Claude Code](https://docs.claude.com/en/docs/cl
 - **TTS on CPU** via Kokoro inside a locally-built Lemonade C++ server (no cloud).
 - **Wake word** via [openWakeWord](https://github.com/dscripka/openWakeWord) ("hey jarvis", pure onnxruntime, bundled Silero VAD for end-of-utterance detection).
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
+- **Focus gated to Claude Code** — F9 and "hey jarvis" only fire when the focused window hosts a `claude.exe` process, so you never accidentally type a transcription into the wrong app.
 
 Based on [`PLAN.md`](PLAN.md), with Windows/ROCm-specific adjustments documented at the bottom.
 
@@ -172,7 +173,8 @@ After `start_services.ps1`:
 - **Wake word never fires.** Speak louder/closer, or drop `WAKE_THRESHOLD` to 0.3 in `ptt/config.py`. Restart daemon.
 - **Wake word fires on every word.** Raise `WAKE_THRESHOLD` to 0.7. Or switch wake model via `WAKE_MODEL` env var (installed: `alexa_v0.1`, `hey_mycroft_v0.1`, `hey_rhasspy_v0.1`, `hey_jarvis_v0.1`, `ok_nabu_v0.1`).
 - **Wake records forever.** Tune `EOU_ENERGY_THRESHOLD` in `ptt/config.py` (default 450 int16 RMS).
-- **Typed text lands in the wrong window.** Don't Alt-Tab while the daemon is transcribing. By design — `pyautogui.typewrite` sends to whatever has focus at the moment the HTTP response arrives.
+- **F9 or wake-word does nothing, daemon log says `suppressed: focus is ...`.** The focus gate rejected the trigger because no `claude.exe` is a descendant of the foreground window. Focus a terminal running `claude`, or override the gate: `PTT_REQUIRE_APPS="claude.exe,codex.exe"` (add apps) or `PTT_REQUIRE_APPS=any` (disable entirely). Restart the daemon after changing env vars.
+- **Typed text lands in the wrong window.** Don't Alt-Tab while the daemon is transcribing — the recorder re-checks focus just before typing and will drop the transcript if focus has shifted, but brief overlaps can still sneak through.
 - **Claude Code Stop hook doesn't fire.** `--plugin-dir` loads commands/skills but doesn't activate plugin hooks in current Claude Code — the installer inlines the same hook into `~/.claude/settings.json` so it fires either way. Verify with `$null | claude --plugin-dir ... --include-hook-events --output-format=stream-json --verbose -p "hi"` and look for a `hook_response` event.
 - **Kokoro plays nothing.** `speak.py`'s Stop-hook path expects `last_assistant_message` in the payload, but Claude Code's headless `-p` mode omits it. `speak.py` falls back to reading `transcript_path` — verify it's readable.
 
@@ -185,6 +187,7 @@ After `start_services.ps1`:
 - **Hooks use `"shell": "powershell"`** — no `.sh`/`.cmd` launcher dance. See [Claude Code hooks docs](https://docs.claude.com/en/docs/claude-code/hooks).
 - **Stop hook lives in `~/.claude/settings.json`, not just in `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks; inline in `settings.json` fires in both `--plugin-dir` dev mode and `/plugin install` prod mode.
 - **Wake word is Phase 1.5 (new).** `openwakeword` (Apache 2.0, pure onnxruntime, bundled Silero VAD).
+- **Focus gate (new)** — F9 / wake only fire when a `claude.exe` process lives under the foreground window. The recorder also re-checks just before typing to protect against focus drift during Whisper's ~150 ms roundtrip.
 - **Venv at workspace root** (`.\.venv`), not `%USERPROFILE%\venvs\voice`. Installer bakes the venv python path into the shims.
 - **Flash attention disabled at runtime.** Compiled in but `whispercpp.args=-nfa` in Lemonade config — rocWMMA FA on gfx1201 produces garbled output today.
 

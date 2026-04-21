@@ -94,9 +94,15 @@ Copy-Tree (Join-Path $WorkspaceRoot "claude-plugin-voice") $PluginDest
 $HooksJson = Join-Path $PluginDest "hooks\hooks.json"
 (Get-Content -Raw $HooksJson).Replace("__VENV_PYTHON__", $VenvPython.Replace("\", "\\")) | Set-Content -Path $HooksJson -NoNewline
 
-# speak.md uses the same placeholder.
+# speak.md takes two placeholders: __VENV_PYTHON__ and __PLUGIN_DIR__.
+# Claude Code's permission system rejects commands containing variable
+# expansions like ${CLAUDE_PLUGIN_DIR}, so we bake the literal path in at
+# deploy time.
 $SpeakMd = Join-Path $PluginDest "commands\speak.md"
-(Get-Content -Raw $SpeakMd).Replace("__VENV_PYTHON__", $VenvPython) | Set-Content -Path $SpeakMd -NoNewline
+(Get-Content -Raw $SpeakMd).
+    Replace("__VENV_PYTHON__", $VenvPython).
+    Replace("__PLUGIN_DIR__", $PluginDest.Replace("\", "/")) `
+    | Set-Content -Path $SpeakMd -NoNewline
 
 Write-Host "[install] plugin installed"
 
@@ -145,11 +151,13 @@ if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $setting
 # /plugin install wires hooks.json. Since most users will run us via
 # --plugin-dir, we inline the hook here so it fires either way.
 $SpeakScript = Join-Path $PluginDest "scripts\speak.py"
+$PluginDirFwd = $PluginDest.Replace("\", "/")
 $mergeScript = @"
 import json, sys
-path         = sys.argv[1]
-venv_python  = sys.argv[2]
-speak_script = sys.argv[3]
+path           = sys.argv[1]
+venv_python    = sys.argv[2]
+speak_script   = sys.argv[3]
+plugin_dir_fwd = sys.argv[4]
 speak_cmd = f'& "{venv_python}" "{speak_script}" --from-hook'
 try:
     with open(path, "r", encoding="utf-8") as fh:
@@ -161,12 +169,21 @@ if not isinstance(data, dict):
 
 perms = data.setdefault("permissions", {})
 allow = perms.setdefault("allow", [])
-for entry in (
+
+# Legacy patterns from earlier installs — remove so stale entries don't
+# accumulate. They used `${CLAUDE_PLUGIN_DIR}` expansion which Claude Code
+# now rejects with "Contains expansion".
+legacy = (
     "Bash(python `${CLAUDE_PLUGIN_DIR}/scripts/*)",
     "Bash(python3 `${CLAUDE_PLUGIN_DIR}/scripts/*)",
-):
-    if entry not in allow:
-        allow.append(entry)
+)
+allow[:] = [e for e in allow if e not in legacy]
+
+# Match the exact command the slash command issues. Wildcard suffix so
+# /voice:speak <arbitrary text> stays covered.
+speak_allow = f'Bash("{venv_python}" "{plugin_dir_fwd}/scripts/speak.py"*)'
+if speak_allow not in allow:
+    allow.append(speak_allow)
 
 hooks = data.setdefault("hooks", {})
 stop_list = hooks.setdefault("Stop", [])
@@ -194,7 +211,7 @@ with open(path, "w", encoding="utf-8") as fh:
 $tempScript = Join-Path ([IO.Path]::GetTempPath()) ("merge_settings_" + [Guid]::NewGuid().ToString("N") + ".py")
 Set-Content -Path $tempScript -Value $mergeScript -NoNewline
 try {
-    & $VenvPython $tempScript $ClaudeSettings $VenvPython $SpeakScript
+    & $VenvPython $tempScript $ClaudeSettings $VenvPython $SpeakScript $PluginDirFwd
     if ($LASTEXITCODE -ne 0) { throw "settings merge failed" }
 } finally {
     Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue

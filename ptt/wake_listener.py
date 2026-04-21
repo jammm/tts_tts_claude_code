@@ -21,6 +21,7 @@ import sounddevice as sd
 from openwakeword.model import Model
 
 from . import config
+from .window_check import describe_current_focus, focus_passes_gate
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,13 @@ class WakeListener:
                         log.info("wake candidate (score=%.3f, below %.2f threshold)",
                                  score, config.WAKE_THRESHOLD)
                     if score >= config.WAKE_THRESHOLD:
+                        # Only pay the process-iteration cost when we're
+                        # actually about to fire.
+                        if not focus_passes_gate():
+                            log.info("wake suppressed: focus is %s (score=%.3f)",
+                                     describe_current_focus(), score)
+                            model.reset()
+                            continue
                         self._last_fire = time.monotonic()
                         log.info("wake fired (score=%.3f)", score)
                         pre_audio = np.concatenate(list(prebuffer)) if prebuffer else None

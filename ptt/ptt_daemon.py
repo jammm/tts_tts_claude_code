@@ -30,6 +30,7 @@ from pynput import keyboard
 from . import config
 from .recorder import Recorder
 from .wake_listener import WakeListener
+from .window_check import describe_current_focus, focus_passes_gate
 
 log = logging.getLogger("ptt")
 
@@ -47,6 +48,9 @@ class PTTKeyHandler:
     def on_press(self, key) -> None:
         if self._is_target(key) and not self._held:
             self._held = True
+            if not focus_passes_gate():
+                log.info("PTT suppressed: focus is %s", describe_current_focus())
+                return
             if self.recorder.start(source="ptt", vad_endpoint=False):
                 self._open_stream()
 

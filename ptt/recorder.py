@@ -17,6 +17,7 @@ import requests
 import soundfile as sf
 
 from . import config
+from .window_check import describe_current_focus, focus_passes_gate
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +128,12 @@ class Recorder:
         text = (text or "").strip()
         if not text:
             log.info("empty transcription, nothing to type")
+            return
+        if not focus_passes_gate():
+            # Guard against focus drifting during Whisper's RTT (~100-300 ms).
+            # Better to drop the transcript than type it into a random app.
+            log.info("dropping transcript, focus shifted to %s: %r",
+                     describe_current_focus(), text)
             return
         log.info("typing: %r", text)
         try:

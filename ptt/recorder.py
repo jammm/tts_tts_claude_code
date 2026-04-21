@@ -1,13 +1,22 @@
-"""Shared Recorder: accepts frames from either F9 PTT or wake-word path,
-encodes to WAV, POSTs to Lemonade /audio/transcriptions, types the result.
+"""Shared Recorder: accepts frames from the F9 PTT or Whisper-wake path,
+encodes to WAV, POSTs to Lemonade /audio/transcriptions, types the
+result via pyautogui.
 
 One mutex guards state so the two activation paths can't collide.
+
+source values the recorder understands:
+    "ptt"           — F9 push-to-talk. Always types the transcription.
+    "whisper_wake"  — WhisperWakeListener kicked us off on an energy
+                      burst. The transcription is only typed if it
+                      matches WAKE_PHRASE at the start; otherwise
+                      silently dropped (wasn't addressed to us).
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 import threading
 import time
 
@@ -20,6 +29,11 @@ from . import config
 from .window_check import describe_current_focus, focus_passes_gate
 
 log = logging.getLogger(__name__)
+
+# Compiled once. Used by the whisper_wake source to gate typing — if
+# the transcription doesn't match this at the start, the utterance
+# wasn't addressed to us and we silently drop.
+_WAKE_RE = re.compile(config.WAKE_PHRASE, re.IGNORECASE)
 
 
 class Recorder:
@@ -129,15 +143,36 @@ class Recorder:
         if not text:
             log.info("empty transcription, nothing to type")
             return
+        if source == "whisper_wake":
+            m = _WAKE_RE.search(text)
+            if not m or m.start() > 8:
+                # No wake phrase near the start — this utterance wasn't
+                # for us. Silent drop (info-level log for debugging).
+                log.info("whisper wake: no match in %r, dropping", text[:80])
+                return
+            command = text[m.end():].lstrip(" ,.:;!?-").strip()
+            if not command:
+                log.info("whisper wake: matched %r but no command after", text)
+                return
+            log.info("whisper wake fired: %r -> command %r", text[:60], command)
+            text = command
         if not focus_passes_gate():
             # Guard against focus drifting during Whisper's RTT (~100-300 ms).
             # Better to drop the transcript than type it into a random app.
             log.info("dropping transcript, focus shifted to %s: %r",
                      describe_current_focus(), text)
             return
-        log.info("typing: %r", text)
+        log.info("typing: %r (auto_submit=%s)", text, config.PTT_AUTO_SUBMIT)
         try:
+            # Trailing space then Enter: the space gives apps with
+            # trailing-newline sensitivity (e.g. shells with
+            # completion menus) a chance to flush the autocomplete
+            # list before the submit arrives. Skipped when
+            # PTT_AUTO_SUBMIT=0 so the user can review before sending.
             pyautogui.typewrite(text + " ", interval=0.005)
+            if config.PTT_AUTO_SUBMIT:
+                time.sleep(0.05)
+                pyautogui.press("enter")
         except Exception:
             log.exception("typewrite failed")
 
@@ -154,10 +189,15 @@ def _transcribe(audio: np.ndarray) -> str:
     sf.write(buf, audio, config.SAMPLE_RATE, subtype="PCM_16", format="WAV")
     buf.seek(0)
     t0 = time.monotonic()
+    data = {"model": config.WHISPER_MODEL}
+    if config.WHISPER_LANGUAGE:
+        data["language"] = config.WHISPER_LANGUAGE
+    if config.WHISPER_PROMPT:
+        data["prompt"] = config.WHISPER_PROMPT
     r = requests.post(
         config.TRANSCRIBE_ENDPOINT,
         files={"file": ("clip.wav", buf, "audio/wav")},
-        data={"model": config.WHISPER_MODEL},
+        data=data,
         timeout=60,
     )
     r.raise_for_status()

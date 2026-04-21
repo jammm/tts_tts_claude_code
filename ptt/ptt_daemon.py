@@ -2,16 +2,17 @@
 
 Holds the process alive. Spawns:
   - pynput global keyboard listener (F9 keydown/keyup for push-to-talk)
-  - openwakeword background thread ("hey jarvis" wake word)
+  - WhisperWakeListener background thread — energy-gated capture +
+    Whisper transcription, matches WAKE_PHRASE against the transcript
 
 Both activation paths funnel into the same Recorder, which talks to the
-Lemonade whisper endpoint and types the result via pyautogui.
+Lemonade Whisper endpoint and types the result via pyautogui.
 
 Run directly during development:
     python -m ptt.ptt_daemon
 
 After install_windows.ps1 copies this tree into %LOCALAPPDATA%\\voice-plugin\\,
-Task Scheduler starts it at logon.
+Task Scheduler (optional) or start_services.ps1 launches it.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from pynput import keyboard
 
 from . import config
 from .recorder import Recorder
-from .wake_listener import WakeListener
+from .whisper_wake_listener import WhisperWakeListener
 from .window_check import describe_current_focus, focus_passes_gate
 
 log = logging.getLogger("ptt")
@@ -128,15 +129,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _setup_logging(args.verbose)
-    log.info("Starting PTT daemon. Lemonade=%s, Whisper=%s", config.LEMONADE_URL, config.WHISPER_MODEL)
-    log.info("Hotkey=%s, WakeModel=%s (threshold=%.2f)", config.PTT_HOTKEY, config.WAKE_MODEL, config.WAKE_THRESHOLD)
+    log.info("Starting PTT daemon. Lemonade=%s, Whisper=%s",
+             config.LEMONADE_URL, config.WHISPER_MODEL)
+    log.info("Hotkey=%s, WakePhrase=%r", config.PTT_HOTKEY, config.WAKE_PHRASE)
 
     stop_event = threading.Event()
     recorder = Recorder()
 
-    wake: WakeListener | None = None
+    wake: WhisperWakeListener | None = None
     if not args.no_wake:
-        wake = WakeListener(recorder, stop_event)
+        wake = WhisperWakeListener(recorder, stop_event)
         wake.start()
 
     key_listener: keyboard.Listener | None = None

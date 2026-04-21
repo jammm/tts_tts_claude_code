@@ -144,7 +144,16 @@ Render-Template `
         "__ROCM_BIN__"    = $RocmBin
     }
 
-Write-Host "[install] shims: $ShimDir\run_lemonade.ps1, $ShimDir\run_ptt.ps1"
+Render-Template `
+    (Join-Path $WorkspaceRoot "installers\run_f5.ps1.tmpl") `
+    (Join-Path $ShimDir "run_f5.ps1") `
+    @{
+        "__VENV_PYTHON__" = $VenvPython
+        "__DAEMON_DIR__"  = $DaemonDest
+        "__ROCM_BIN__"    = $RocmBin
+    }
+
+Write-Host "[install] shims: $ShimDir\run_lemonade.ps1, $ShimDir\run_ptt.ps1, $ShimDir\run_kokoro.ps1, $ShimDir\run_f5.ps1"
 
 # ---------------------------------------------------------------- settings.json
 $ClaudeSettings = Join-Path $env:USERPROFILE ".claude\settings.json"

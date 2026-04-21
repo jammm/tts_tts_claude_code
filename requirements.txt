@@ -1,9 +1,30 @@
+# Base deps for the PTT daemon and Claude Code plugin. F5-TTS is pulled
+# in separately from tools/install_f5.md if you opt into the GPU TTS
+# backend — it's not a hard requirement since Lemonade ships CPU Kokoro
+# out of the box.
+
+# Lemonade ROCm server bindings (also includes CPU Kokoro TTS + ROCm
+# whisper.cpp STT models via `lemonade pull`).
 lemonade-sdk==9.1.4
+
+# PTT daemon: F9 global hotkey + mic capture + HTTP + typing into focus.
 pynput==1.8.1
 sounddevice==0.5.5
-numpy==2.4.4
 requests==2.33.1
 pyautogui==0.9.54
 soundfile==0.13.1
-openwakeword==0.6.0
+
+# psutil drives the focus gate (walks ancestor processes so "hey halo"
+# only fires into a terminal where claude.exe is running).
 psutil>=6.1.1
+
+# f5-tts's transitive deps pin numpy<2. TheRock PyTorch, Lemonade, and
+# everything else we use build fine against 1.26, so we accept the
+# downgrade rather than fight it.
+numpy>=1.26,<2
+
+# Optional GPU TTS backend (flow-matching DiT; pure eager PyTorch on
+# ROCm, no torch.compile recompile cliffs). Unused if you stay on
+# Lemonade CPU Kokoro, but the import is cheap so we keep the dep here
+# to avoid "oh you also need to pip install this" foot-guns later.
+f5-tts==1.1.20

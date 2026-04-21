@@ -28,6 +28,10 @@ __pycache__/
 # Audio test artifacts
 *.wav
 
+# openwakeword model cache (we don't use openwakeword anymore, but
+# older checkouts may have left this lying around)
+pretrained_models/
+
 # Logs
 *.log
 

@@ -79,23 +79,47 @@ function Wait-ForHealth([string]$url, [int]$timeoutSec) {
 $lemPid = Start-Service -Name "lemonade" -ShimPath (Join-Path $Base "run_lemonade.ps1") -ExistingPid (_get $existing "lemonade")
 [void](Wait-ForHealth "http://localhost:13305/api/v1/health" 8)
 
-# 2. Kokoro (TTS on GPU) — model load + JIT warmup takes ~30s on cold start.
-$kokoroPid = Start-Service -Name "kokoro" -ShimPath (Join-Path $Base "run_kokoro.ps1") -ExistingPid (_get $existing "kokoro")
-Write-Host "[start] waiting for kokoro model load + JIT warmup (up to 90s)..."
-[void](Wait-ForHealth "http://localhost:13306/api/v1/health" 90)
+# 2. TTS. Default is "cpu" = Lemonade's built-in Kokoro on :13305 (no
+# extra process to start). Set VOICE_TTS=f5 for F5-TTS on GPU (:13307,
+# pure-eager PyTorch) or VOICE_TTS=kokoro for our ROCm Kokoro service
+# (:13306, torch.compile).
+$ttsBackend = if ($env:VOICE_TTS) { $env:VOICE_TTS.ToLower() } else { "cpu" }
+$ttsPid   = 0
+$ttsPort  = 13305
+$ttsLabel = "lemonade (TTS/CPU Kokoro)"
+if ($ttsBackend -eq "kokoro") {
+    $ttsPid = Start-Service -Name "kokoro" -ShimPath (Join-Path $Base "run_kokoro.ps1") -ExistingPid (_get $existing "kokoro")
+    Write-Host "[start] waiting for kokoro model load + warmup sweep (up to 240s)..."
+    [void](Wait-ForHealth "http://localhost:13306/api/v1/health" 240)
+    $ttsPort  = 13306
+    $ttsLabel = "kokoro (TTS/GPU)"
+} elseif ($ttsBackend -eq "f5") {
+    $ttsPid = Start-Service -Name "f5" -ShimPath (Join-Path $Base "run_f5.ps1") -ExistingPid (_get $existing "f5")
+    Write-Host "[start] waiting for F5-TTS model load + warmup (up to 120s)..."
+    [void](Wait-ForHealth "http://localhost:13307/api/v1/health" 120)
+    $ttsPort  = 13307
+    $ttsLabel = "f5 (TTS/GPU)"
+}
+# "cpu" falls through: lemonade on :13305 already serves /audio/speech
+# via kokoro-v1, no extra service needed.
 
 # 3. PTT daemon (F9 + wake word)
 $pttPid = Start-Service -Name "ptt" -ShimPath (Join-Path $Base "run_ptt.ps1") -ExistingPid (_get $existing "ptt")
 
-@{ lemonade = $lemPid; kokoro = $kokoroPid; ptt = $pttPid; started_at = (Get-Date).ToString("o") } `
-    | ConvertTo-Json | Set-Content -Path $PidFile -NoNewline
+$state = @{ lemonade = $lemPid; ptt = $pttPid; tts_backend = $ttsBackend; started_at = (Get-Date).ToString("o") }
+if ($ttsBackend -eq "kokoro") { $state.kokoro = $ttsPid }
+elseif ($ttsBackend -eq "f5") { $state.f5 = $ttsPid }
+$state | ConvertTo-Json | Set-Content -Path $PidFile -NoNewline
 
 Write-Host ""
 Write-Host "Services up. Health:"
-foreach ($endpoint in @(
-    @{ name = "lemonade (STT)"; url = "http://localhost:13305/api/v1/health" },
-    @{ name = "kokoro (TTS/GPU)"; url = "http://localhost:13306/api/v1/health" }
-)) {
+$endpoints = @(@{ name = "lemonade (STT)"; url = "http://localhost:13305/api/v1/health" })
+if ($ttsBackend -ne "cpu") {
+    $endpoints += @{ name = $ttsLabel; url = "http://localhost:$ttsPort/api/v1/health" }
+} else {
+    Write-Host "  tts backend: Lemonade CPU Kokoro (via :13305 /api/v1/audio/speech)"
+}
+foreach ($endpoint in $endpoints) {
     try {
         $h = Invoke-RestMethod -Uri $endpoint.url -TimeoutSec 2 -UseBasicParsing
         Write-Host ("  " + $endpoint.name + ": " + ($h | ConvertTo-Json -Compress))

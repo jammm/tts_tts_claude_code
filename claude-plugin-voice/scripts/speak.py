@@ -28,13 +28,16 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 
-# By default we hit the ROCm Kokoro service (GPU) on :13306. Override to
-# http://127.0.0.1:13305 to fall back to Lemonade's CPU Kokoro.
+# By default we hit Lemonade's CPU Kokoro on :13305 — it's the simplest
+# path (Lemonade is already running for STT, no extra service to start).
+# Override to http://127.0.0.1:13307 for F5-TTS on the GPU (pure-eager
+# PyTorch, no torch.compile recompile cliffs) or :13306 for our custom
+# ROCm Kokoro service.
 # Use 127.0.0.1 rather than localhost: on Windows, name resolution tries
 # IPv6 (::1) first and the failed-then-fallback path adds ~2s per fresh
 # connection. speak.py runs as a short-lived subprocess per Claude turn so
 # it never benefits from connection reuse.
-TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:13306")
+TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:13305")
 SPEECH_ENDPOINT = f"{TTS_URL}/api/v1/audio/speech"
 KOKORO_MODEL = os.environ.get("KOKORO_MODEL", "kokoro-v1")
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")

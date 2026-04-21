@@ -1,7 +1,7 @@
 """Runtime configuration for the PTT daemon.
 
-All paths and tunables live here so install_windows.ps1 can patch LEMONADE_URL
-or TTS_LOCK_PATH without touching code.
+All paths and tunables live here so install_windows.ps1 can patch
+LEMONADE_URL or TTS_LOCK_PATH without touching code.
 """
 
 from __future__ import annotations
@@ -12,31 +12,68 @@ from pathlib import Path
 # 127.0.0.1 not localhost — see speak.py for the Windows IPv6-fallback note.
 LEMONADE_URL = os.environ.get("LEMONADE_URL", "http://127.0.0.1:13305")
 TRANSCRIBE_ENDPOINT = f"{LEMONADE_URL}/api/v1/audio/transcriptions"
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Whisper-Small")
+
+# Whisper-Large-v3-Turbo: ~800 M params distilled from Large-v3. Near-Large
+# accuracy at ~Medium speed. Whisper-Small mishears technical English
+# ("what's the current time" -> "watch the word") at a rate that's
+# unworkable for dictating Claude Code prompts. Override to a smaller
+# variant (Whisper-Small / Whisper-Base) if you want faster STT at the
+# cost of accuracy.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Whisper-Large-v3-Turbo")
+# Force-English decoding + a short context prompt that biases Whisper
+# toward the vocabulary of a developer talking to an AI assistant. Leave
+# WHISPER_PROMPT empty to disable. The prompt never ends up in the
+# transcription output — Whisper uses it only as a conditioning hint.
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
+WHISPER_PROMPT = os.environ.get(
+    "WHISPER_PROMPT",
+    "The user is talking to an AI coding assistant. They may mention "
+    "programming terms, file names, commands, or ask about code, tests, "
+    "builds, and deployment.",
+)
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "int16"
-CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — matches openwakeword's expected frame
+CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — convenient fixed frame size
 
 PTT_HOTKEY = os.environ.get("PTT_HOTKEY", "f9")
 
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_jarvis_v0.1")
-WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
-WAKE_VAD_THRESHOLD = float(os.environ.get("WAKE_VAD_THRESHOLD", "0.5"))
-WAKE_PREBUFFER_FRAMES = 7  # ~560 ms of audio prepended so first word isn't clipped
+# After typing the transcription, also press Enter so the prompt gets
+# submitted automatically. Set PTT_AUTO_SUBMIT=0 if you want to review
+# the text before sending.
+PTT_AUTO_SUBMIT = os.environ.get("PTT_AUTO_SUBMIT", "1").lower() not in (
+    "0", "off", "false", "no", "",
+)
+
+# Wake-word detection works by reusing Whisper itself — every energy-gated
+# speech burst gets transcribed, and if the transcription matches
+# WAKE_PHRASE at the start, we strip the match and type the remainder
+# (otherwise silently drop). No keyword-spotter dependency, and changing
+# the wake phrase is a one-env-var change rather than training a custom
+# model.
+WAKE_PHRASE = os.environ.get(
+    "WAKE_PHRASE",
+    # "hey halo" and common Whisper mishearings of "halo".
+    r"^\s*(?:hey[,\s]+|ok[,\s]+|okay[,\s]+)?"
+    r"(?:halo|hello|hallo|hailo|halow|haloo|hollow)"
+    r"[\s,.:;!?-]*",
+)
 WAKE_COOLDOWN_SECONDS = 2.0
 
-# End-of-utterance detection for wake-word recordings (energy-based, simple).
-# The wake listener passes frames to the recorder; once EOU_SILENCE_MS of
-# below-threshold audio has accrued, we stop and transcribe.
+# End-of-utterance detection for wake-word recordings. Once EOU_SILENCE_MS
+# of below-threshold audio has accrued, we stop capturing and transcribe.
+# Also gates the Whisper-wake listener: if a frame's RMS is below
+# EOU_ENERGY_THRESHOLD while idle, we stay idle (we're not hearing speech
+# yet, no point recording).
 EOU_SILENCE_MS = 800
 EOU_MAX_RECORDING_MS = 10_000
 EOU_ENERGY_THRESHOLD = 450  # int16 RMS; tuned by ear — lower = more sensitive
 
-# Cross-process signal: speak.py touches this file while Kokoro is playing so
-# the wake listener stays quiet. Prevents Kokoro speaking "jarvis" from
-# re-triggering itself.
+
+# Cross-process signal: speak.py touches this file while Kokoro is
+# playing so the wake listener stays quiet. Prevents the TTS reading a
+# reply back from re-triggering the wake path on itself.
 def _default_lock_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
     if base:

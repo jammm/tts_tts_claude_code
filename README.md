@@ -1,149 +1,195 @@
-# Local Voice I/O for Claude Code — Windows + RX 9070 XT (ROCm)
+# Local Voice I/O for Claude Code — Windows + AMD ROCm
 
-Local TTS + STT + wake-word for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows 11, all running on the GPU via ROCm:
+Local STT, wake word, and TTS for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows 11. Everything runs on your own machine — no cloud.
 
-- **STT on the 9070 XT** via a ROCm-enabled whisper.cpp we build from source (27× real-time with Whisper-Small on gfx1201).
-- **TTS on the 9070 XT** via [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) running in PyTorch with `torch.compile` + [triton-windows](https://pypi.org/project/triton-windows/) on gfx1201 (~95-400 ms, 14-24× real-time, 3-4× faster than CPU Kokoro).
-- **Wake word** via [openWakeWord](https://github.com/dscripka/openWakeWord) ("hey jarvis", pure onnxruntime, bundled Silero VAD for end-of-utterance detection).
+- **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp (Whisper-Large-v3-Turbo, ~27× real-time on a 9070 XT with gfx1201).
+- **Wake word ("hey halo" by default)** — no custom keyword-spotter. Every energy-gated speech burst gets transcribed by Whisper; the transcript is typed only if it starts with the configured wake phrase. Changing the wake phrase is a single env var.
+- **TTS via Lemonade's bundled CPU Kokoro** by default. A pure-eager-PyTorch GPU backend ([F5-TTS on ROCm](#optional-f5-tts-on-gpu)) is available opt-in via `VOICE_TTS=f5`.
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
-- **Focus gated to Claude Code** — F9 and "hey jarvis" only fire when the focused window hosts a `claude.exe` process, so you never accidentally type a transcription into the wrong app.
-
-No DirectML, no ONNX on the GPU, no cloud. TheRock PyTorch + our own whisper.cpp HIP build do all the compute.
+- **Focus gated to Claude Code** — F9 and wake only fire when the foreground window hosts a `claude.exe` process (or a terminal that has `claude` running alongside). Transcriptions never accidentally land in the wrong app.
+- **Auto-submit** — the daemon presses Enter after typing the transcription so Claude starts processing the moment you stop talking. Set `PTT_AUTO_SUBMIT=0` to review before sending.
 
 Based on [`PLAN.md`](PLAN.md), with Windows/ROCm-specific adjustments documented at the bottom.
+
+## For AI agents working in this repo
+
+If you're another Claude agent picking up this codebase, read this whole section before touching anything — the short version of how the pieces fit together:
+
+- **Three things run on localhost**: `lemond.exe` (port 13305, STT+CPU TTS), optionally the F5-TTS service (port 13307, GPU TTS), and the `ptt_daemon` Python process (no port; F9 + wake word + typing). Lemonade is always required. F5 is opt-in. The PTT daemon is always required.
+- **Code lives in four places:**
+  - `ptt/` — the PTT daemon (wake detection, recording, transcription, typing) and the optional `kokoro_server.py` / `f5_tts_server.py` GPU TTS services.
+  - `claude-plugin-voice/` — the Claude Code plugin (Stop hook that speaks replies, `/voice:speak` slash command).
+  - `installers/` — PowerShell scripts that deploy code from `ptt/` + `claude-plugin-voice/` into `%LOCALAPPDATA%\voice-plugin\` and `~/.claude/plugins/voice\`, plus `run_*.ps1.tmpl` shims that start the services.
+  - `tools/` + `deps/` + `vendor/` — build scripts and compiled binaries for the ROCm Whisper / Lemonade C++ servers.
+- **The config file is the contract.** `ptt/config.py` is the single source of truth for tunables. If you're adjusting behavior, go through env vars declared in there. Don't hard-code values in other files.
+- **Do not restart services in the middle of debugging unless necessary.** Services run in the background and log to `%LOCALAPPDATA%\voice-plugin\logs\`. Tail those files before killing anything. The PID file at `%LOCALAPPDATA%\voice-plugin\services.json` tracks which process is which; `stop_services.ps1` expects it.
+- **The repo is a git clone at `d:\jam\demos` and a GitHub remote at `origin`**. Submodules under `deps/` pin specific upstream commits — don't update them casually.
+- **`PLAN.md` is the original design doc. Don't edit it.** It's the aspirational starting point; this README is what actually got built.
+- **Don't assume a specific GPU.** The 9070 XT (gfx1201) is the dev machine, but the target test platform is Strix Halo (gfx1151, Radeon 8060S iGPU). Anything that relies on 9070 XT-only ROCm features is a bug.
 
 ## Repo layout
 
 ```
 .
-├── PLAN.md                       original design doc
+├── PLAN.md                       original design doc (historical)
 ├── README.md                     this file
 ├── requirements.txt              Python deps (PTT daemon + plugin)
-├── ptt/                          F9 + wake daemon + focus gate + kokoro_server.py
-├── claude-plugin-voice/          Claude Code plugin (Stop-hook TTS + /voice:speak)
+├── ptt/                          daemon + optional GPU TTS services
+│   ├── config.py                 env-driven knobs (WAKE_PHRASE, etc.)
+│   ├── ptt_daemon.py             entry point: F9 hook + wake listener
+│   ├── whisper_wake_listener.py  energy-VAD + Whisper wake-phrase check
+│   ├── recorder.py               capture -> POST to whisper -> type
+│   ├── window_check.py           focus gate (claude.exe under foreground?)
+│   ├── f5_tts_server.py          opt-in GPU TTS service (port 13307)
+│   └── kokoro_server.py          experimental GPU Kokoro (port 13306)
+├── claude-plugin-voice/          Claude Code plugin
+│   ├── .claude-plugin/plugin.json
+│   ├── commands/speak.md         /voice:speak slash command
+│   ├── hooks/hooks.json          Stop hook (inline-copied to settings.json)
+│   └── scripts/speak.py          fetches WAV from TTS, plays via sounddevice
 ├── installers/
-│   ├── install_windows.ps1       deploys plugin + daemon + settings.json hook
-│   ├── start_services.ps1        launches lemond + kokoro + PTT (hidden background)
-│   ├── stop_services.ps1         kills all three by pidfile + orphan walk
+│   ├── install_windows.ps1       deploys plugin + daemon + merges settings.json
+│   ├── start_services.ps1        launches lemonade + optional TTS + PTT
+│   ├── stop_services.ps1         kills all by pidfile + orphan walk
 │   ├── uninstall_windows.ps1
-│   └── run_{lemonade,kokoro,ptt}.ps1.tmpl
+│   └── run_{lemonade,kokoro,f5,ptt}.ps1.tmpl   service launch shims
 ├── tools/
-│   ├── build_lemonade_cpp.cmd    builds lemond.exe into vendor/lemonade-cpp/
-│   └── build_whisper_hip.cmd     builds whisper-server.exe (ROCm/gfx1201) into vendor/whisper-cpp-rocm/
-└── deps/                         git submodules (submodule init to populate)
-    ├── lemonade/                 → lemonade-sdk/lemonade (tag v10.2.0) — STT server
-    ├── whisper.cpp/              → ggml-org/whisper.cpp (upstream)
-    └── llama.cpp/                → ggml-org/llama.cpp (upstream; ggml overlay source)
+│   ├── build_lemonade_cpp.cmd    builds lemond.exe (Lemonade C++ server)
+│   └── build_whisper_hip.cmd     builds whisper-server.exe (ROCm/gfx1201)
+└── deps/                         git submodules
+    ├── lemonade/                 lemonade-sdk/lemonade (tag v10.2.0)
+    ├── whisper.cpp/              ggml-org/whisper.cpp
+    └── llama.cpp/                ggml-org/llama.cpp (ggml overlay source)
 
-# gitignored, generated by the build steps below:
-.venv/                            Python 3.12 venv: TheRock ROCm, torch, triton-windows, kokoro
-vendor/lemonade-cpp/              lemond.exe + resources/ + lemonade.exe
-vendor/whisper-cpp-rocm/          whisper-server.exe + ggml-hip.dll + co-located DLLs
-%LOCALAPPDATA%/voice-plugin/      installed daemon + run_*.ps1 shims + logs/ + services.json
+# gitignored, generated by bootstrap/build:
+.venv/                            Python 3.12 venv: TheRock ROCm torch, f5-tts, etc.
+vendor/lemonade-cpp/              lemond.exe + resources/
+vendor/whisper-cpp-rocm/          whisper-server.exe + ggml-hip.dll + ROCm DLLs
+%LOCALAPPDATA%/voice-plugin/      installed daemon + run_*.ps1 shims + logs/
+~/.claude/plugins/voice/          installed Claude Code plugin
+~/.claude/settings.json           merged by install_windows.ps1 (hook + allowlist)
 ```
 
-### Three services, three ports
+### Services and ports
 
-| service | port | what it serves | backend |
-|---|---|---|---|
-| `lemond` | `13305` | `/api/v1/audio/transcriptions` (STT) | ROCm whisper-server (our build) |
-| `kokoro_server` | `13306` | `/api/v1/audio/speech` (TTS) | PyTorch + `torch.compile` + Triton on gfx1201 |
-| `ptt_daemon` | — | F9 + wake-word + recorder + typer | pynput + openwakeword + sounddevice |
+| service       | port  | what it serves                                      | backend                                                |
+|---------------|------:|-----------------------------------------------------|--------------------------------------------------------|
+| `lemond`      | 13305 | `/api/v1/audio/transcriptions` + `/audio/speech`    | ROCm whisper.cpp (our build) + CPU Kokoro TTS          |
+| `f5_tts`      | 13307 | `/api/v1/audio/speech` (opt-in)                     | F5-TTS (DiT + Vocos) in pure eager PyTorch on ROCm     |
+| `kokoro_server` | 13306 | `/api/v1/audio/speech` (experimental)              | hexgrad/Kokoro-82M with `torch.compile(backend=eager)` |
+| `ptt_daemon`  | —     | F9 hotkey + Whisper-wake + recorder + typer         | pynput + sounddevice + HTTP to lemond                   |
+
+Default runtime is just `lemond` + `ptt_daemon`. F5 and Kokoro-GPU are opt-in via `VOICE_TTS=f5` or `VOICE_TTS=kokoro`.
 
 ## Prerequisites
 
-- Windows 11, AMD Radeon RX 9070 XT (gfx1201) or other gfx120X RDNA4 card
-- Python 3.12 (`py -3.12` on PATH)
-- Visual Studio 2022 (Community fine — Desktop C++ workload)
+- Windows 11, AMD Radeon RX 9000-series or Ryzen AI Max+ / Strix Halo (gfx120X / gfx1151)
+- Python 3.12 on `PATH` as `py -3.12`
+- Visual Studio 2022 Community (Desktop C++ workload) — needed to build `lemond.exe` and `whisper-server.exe`
 - CMake 3.28+
 - Git
-- Claude Code (`claude` CLI)
+- Claude Code CLI (`claude`)
 
 ## Bootstrap on a fresh clone
 
 ```powershell
-# 1. Get the source tree (submodules are upstream whisper.cpp, llama.cpp, lemonade)
+# 1. Source + submodules
 git clone https://github.com/jammm/tts_tts_claude_code.git
 cd tts_tts_claude_code
 git submodule update --init --recursive
 
-# 2. Python venv + plugin/daemon deps
+# 2. Python venv + base deps
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install -r requirements.txt
-python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# 3. TheRock ROCm (torch + HIP SDK for gfx120X) + triton-windows for torch.compile
+# 3. TheRock ROCm PyTorch (torch + HIP SDK for gfx120X / gfx1151).
+# For Strix Halo, swap "gfx120X-all" for "gfx1151" in the index URL.
 pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
-rocm-sdk init            # extracts the devel bundle into site-packages (~1.3 GB)
-pip install triton-windows kokoro
+rocm-sdk init        # extracts the ROCm runtime into the venv (~1.3 GB)
 
-# 4. Build Lemonade C++ server (~2 min clean)
+# 4. Build the two C++ binaries (~3-4 min total on a warm box)
 .\tools\build_lemonade_cpp.cmd
-
-# 5. Build ROCm whisper-server for gfx1201 (~1.5 min clean; overlays llama.cpp ggml onto whisper.cpp)
 .\tools\build_whisper_hip.cmd
 
-# 6. One-time: start lemond and pull the Whisper STT model
-.\vendor\lemonade-cpp\lemond.exe           # leave running in this terminal
-.\vendor\lemonade-cpp\lemonade.exe pull Whisper-Small
-# Ctrl-C the lemond above; start_services.ps1 will run it properly next.
-# (Kokoro TTS is fetched automatically by kokoro_server on first start
-#  from huggingface.co/hexgrad/Kokoro-82M into ~/.cache/huggingface/.)
+# 5. Pull the Whisper STT model into Lemonade's cache
+.\vendor\lemonade-cpp\lemond.exe          # leave running in this shell
+.\vendor\lemonade-cpp\lemonade.exe pull Whisper-Large-v3-Turbo
+# (Whisper-Small works too if you want ~3x faster but noticeably less
+# accurate STT. Override with WHISPER_MODEL env var.)
+# Ctrl-C the lemond above — start_services.ps1 launches it properly later.
 
-# 7. Deploy plugin + daemon + Stop hook into ~/.claude/
+# 6. Deploy plugin + daemon + settings.json hook
 .\installers\install_windows.ps1
 
-# 8. Launch (first start_services.ps1 after a fresh clone takes ~60-90s
-#    because kokoro_server needs to torch.compile + JIT-warm its Triton
-#    kernels for a few representative sequence lengths).
+# 7. Launch services
 .\installers\start_services.ps1
 ```
 
-The installer **does not** touch Task Scheduler by default — you start/stop services yourself. For auto-start on logon, see "Auto-start at logon" below.
-
-Claude Code needs to know about the plugin; `--plugin-dir` works per-session:
+After step 7 you have `lemond` (STT+TTS) + `ptt_daemon` running. F9 push-to-talk and "hey halo" wake-word are both armed.
 
 ```powershell
 claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
 ```
 
-(The Stop hook is also inlined into `~/.claude/settings.json` by the installer, so it fires without `--plugin-dir` too.)
+The Stop hook is also merged into `~/.claude/settings.json` by the installer, so it fires without `--plugin-dir` too.
 
 ## Running the services
 
 ```powershell
-.\installers\start_services.ps1   # background launch of lemonade + kokoro + ptt; health-probes before returning
-.\installers\stop_services.ps1    # kills all three by pidfile + orphan walk
+.\installers\start_services.ps1     # launches whatever VOICE_TTS asks for
+.\installers\stop_services.ps1      # kills all by pidfile + orphan walk
 ```
 
-- All three processes run hidden with stdout/stderr redirected to `%LOCALAPPDATA%\voice-plugin\logs\<name>-<timestamp>.log`. Tail those to debug.
-- `%LOCALAPPDATA%\voice-plugin\services.json` records the PIDs so `stop_services.ps1` can find them across shells.
-- Safe to re-run `start_services.ps1` — it skips whichever service is already up.
-- `kokoro` can take ~60-90 s to come healthy on a cold start (torch.compile + Triton kernel JIT for each representative shape). Triton artifacts cache at `%LOCALAPPDATA%\voice-plugin\triton-cache\` so subsequent starts are much faster.
+- All processes run hidden; stdout/stderr goes to `%LOCALAPPDATA%\voice-plugin\logs\<name>-<timestamp>.log`. Tail those to debug anything weird.
+- `%LOCALAPPDATA%\voice-plugin\services.json` records PIDs so `stop_services.ps1` can find them across shells.
+- Re-running `start_services.ps1` is safe — it skips any service whose recorded PID is still alive.
 
-Check state:
+### Switching TTS backends
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:13305/api/v1/health    # lemonade (STT)
-Invoke-RestMethod http://127.0.0.1:13306/api/v1/health    # kokoro_server (TTS/GPU)
-Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" `
-    | Where-Object CommandLine -match "ptt_daemon|kokoro_server" `
-    | Select-Object ProcessId, CommandLine
+# Default: Lemonade CPU Kokoro (already running as part of lemond)
+.\installers\stop_services.ps1 && .\installers\start_services.ps1
+
+# F5-TTS on GPU (pure eager, consistent 300-900 ms/sentence)
+$env:VOICE_TTS = "f5"
+.\installers\stop_services.ps1 && .\installers\start_services.ps1
+
+# Experimental: our torch.compile-based Kokoro on GPU
+$env:VOICE_TTS = "kokoro"
+.\installers\stop_services.ps1 && .\installers\start_services.ps1
 ```
 
-`lemond` also writes its own log to `%TEMP%\lemonade-server.log` regardless of how it was launched.
+`speak.py` picks the server based on `TTS_URL` env var (defaults to `http://127.0.0.1:13305`). If you flip `VOICE_TTS=f5` you also want `TTS_URL=http://127.0.0.1:13307` in the shell where you run `claude`:
 
-### Running the daemon interactively (for debugging)
+```powershell
+$env:VOICE_TTS = "f5"; .\installers\stop_services.ps1; .\installers\start_services.ps1
+$env:TTS_URL = "http://127.0.0.1:13307"
+claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
+```
+
+### Running the daemon interactively
 
 ```powershell
 .\installers\stop_services.ps1
 .\.venv\Scripts\Activate.ps1
 $env:PYTHONPATH = "."
 python -m ptt.ptt_daemon --verbose
-# F9 hold-to-talk + "hey jarvis" wake both armed. Ctrl-C to stop.
+# F9 + "hey halo" both armed. Ctrl-C to stop.
 # Useful flags: --no-wake, --no-ptt
+```
+
+### Checking status
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:13305/api/v1/health    # lemonade (STT + CPU TTS)
+# If VOICE_TTS=f5:
+Invoke-RestMethod http://127.0.0.1:13307/api/v1/health    # F5-TTS
+# Processes:
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" `
+    | Where-Object CommandLine -match "ptt_daemon|f5_tts_server|kokoro_server" `
+    | Select-Object ProcessId, CommandLine
 ```
 
 ### Auto-start at logon (optional)
@@ -151,112 +197,93 @@ python -m ptt.ptt_daemon --verbose
 ```powershell
 .\installers\install_windows.ps1 -RegisterScheduledTasks
 Start-ScheduledTask VoiceLemonade
-Start-ScheduledTask VoiceKokoro
 Start-ScheduledTask VoicePTT
 ```
 
-`uninstall_windows.ps1` removes the tasks.
+`uninstall_windows.ps1` removes them.
 
-## Measured performance
+## Key configuration
 
-All on the same 9070 XT + Threadripper PRO 9995WX, warm (kernels/caches hot), over `http://127.0.0.1`:
+All tunables are env vars read by `ptt/config.py` (daemon) or the TTS servers. Set them in the shell before `start_services.ps1`.
 
-### STT (Whisper-Small, 3.3 s input clip)
+**Wake phrase** — the big one. Default matches "hey halo" plus common Whisper mishearings ("hello", "hallo", "hailo", etc.). Change via `WAKE_PHRASE` (full regex, must match at the start of the transcript):
 
-| backend | wall | real-time factor |
-|---|---|---|
-| **ROCm whisper.cpp (our build)** | **~125 ms** | **27×** |
-| CPU (lemonade's bundled whisper-server) | ~2860 ms | 1.15× |
+```powershell
+# "hey claude"
+$env:WAKE_PHRASE = "^\s*(?:hey[,\s]+|ok[,\s]+)?claude[\s,.:;!?-]*"
+# "computer,"
+$env:WAKE_PHRASE = "^\s*computer[\s,.:;!?-]*"
+```
 
-Flash attention compiled in but runtime-disabled (`-nfa`): the rocWMMA FA path produces garbled output on gfx1201 today. The non-FA GPU path is still 24× faster than CPU.
+**STT model** — Whisper-Large-v3-Turbo by default for accuracy. Override:
 
-### TTS (Kokoro-82M)
+```powershell
+$env:WHISPER_MODEL = "Whisper-Small"   # faster, less accurate
+$env:WHISPER_MODEL = "Whisper-Medium"  # middle ground
+```
 
-Runs on the 9070 XT in **eager PyTorch** (no `torch.compile`) with MIOpen driving the LSTM path. `torch.compile(mode="reduce-overhead")` initially gave a 3-4× speedup but the CUDA-graph path produces audible artifacts on ROCm 7.2 (tinnitus hiss at utterance start, hoarse voiced sustain), so we turned it off. Set `KOKORO_COMPILE=1` to opt in if you want the speedup and don't mind the quality loss.
+**STT hints** — the daemon passes `language=en` and a short context prompt ("The user is talking to an AI coding assistant...") to bias Whisper toward technical vocabulary. Override with `WHISPER_LANGUAGE=""` / `WHISPER_PROMPT=""` to disable either.
 
-Eager-mode latencies, warm, over `http://127.0.0.1`:
+**Auto-submit** — Enter is pressed after typing. `PTT_AUTO_SUBMIT=0` to disable.
 
-- "Hello." → ~0.5-1 s
-- 9.65 s of audio from a long sentence → ~1.5-2 s
+**Energy threshold** for wake capture — `EOU_ENERGY_THRESHOLD` (int16 RMS, default 450). Lower = more sensitive.
 
-Still faster than real-time for any Claude reply length, just not as dramatically as the compiled path. Compared to the CPU Kokoro baseline:
-
-- GPU eager is ~2× faster than CPU for long text.
-- For short text the two are roughly equivalent.
-
-Gotchas we ran into getting this to work correctly:
-
-1. **Wrap only `KModel.forward`, not the whole module** — wrapping the module breaks KPipeline's truthy check (`if model and ...` calls `__len__` on OptimizedModule which raises).
-2. **Single dedicated inference worker thread** — when we were using `torch.compile`'s CUDA graphs, uvicorn's threadpool hopping invalidated them. The dedicated worker is harmless with eager too and keeps the path simple.
-3. **Clients must hit `http://127.0.0.1` rather than `http://localhost`** — the Windows DNS resolver tries `::1` first and falls back to IPv4 on connection refused, eating ~2 s per fresh connection. `speak.py` is a short-lived subprocess per turn so it never benefits from HTTP keep-alive.
-4. **Peak-normalize** to match Lemonade's ONNX amplitude. hexgrad/Kokoro-82M outputs ~2.5× quieter than `mikkoph/kokoro-onnx`, which perceptually reads as "muffled". Tunable via `KOKORO_TARGET_PEAK` (default 0.5).
-
-### Wake word
-
-| thing | backend | latency |
-|---|---|---|
-| "hey jarvis" detection score | onnxruntime CPU | <100 ms per 80 ms audio chunk |
+**F5-TTS** (when `VOICE_TTS=f5`): `F5_NFE=32` (default, 16 and 8 trade quality for speed), `F5_SPEED=1.15`, `F5_TAIL_PAD_MS=180`, `F5_REF_AUDIO`, `F5_REF_TEXT`. See `ptt/f5_tts_server.py` docstring.
 
 ## Interactive test checklist
 
 After `start_services.ps1`:
 
-1. **HTTP roundtrip smoke** — `python tmp\verify_roundtrip.py` (works from a scratch tmp dir if you recreate it). TTS < 2 s, STT < 200 ms warm, 100 % similarity on JFK-style input.
-2. **F9 PTT** — focus any terminal, hold F9, speak, release. Transcription types at the cursor within ~1.5 s after release.
-3. **"Hey jarvis" wake** — focus a terminal. In one breath say `"hey jarvis, what is the current time"`. Daemon records until ~800 ms of silence, then types.
-4. **Stop hook (auto-TTS)**:
+1. **STT smoke** — hold F9, speak a sentence, release. Transcription should type + submit within ~1-2 s of release.
+2. **Wake word** — say *"hey halo, what is the current time"*. The daemon records until ~800 ms of silence, strips `"hey halo"`, types `what is the current time` + Enter.
+3. **Stop hook (TTS)**:
    ```powershell
    $null | claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice" -p "Say hi in five words"
    ```
-   After text arrives, Kokoro speaks the reply through your speakers.
-5. **`/voice:speak`** — interactive `claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"`, then `/voice:speak Hello from the voice plugin.`
-6. **Feedback-loop guard** — say "hey jarvis" *while* Kokoro is mid-sentence from step 4. The wake listener ignores it (speak.py holds `tts_active.lock`); after playback ends the lock clears and wake fires normally.
-7. **Resilience** — `Get-Process lemond | Stop-Process -Force`, then re-run step 4. `speak.py` logs a connection error to stderr, exits 0, and Claude's turn ends normally.
+   After the text prints, Kokoro speaks it through your speakers.
+4. **`/voice:speak`** — inside `claude`, `/voice:speak Hello from the voice plugin.`
+5. **Feedback-loop guard** — say "hey halo" *while* TTS is speaking. The wake listener ignores it (speak.py holds `tts_active.lock` during playback). After playback ends, wake fires normally.
+6. **Focus gate** — run `claude` in a terminal, then Alt-Tab to another window (browser, text editor). Say "hey halo, test". Nothing happens because the focus check fails. Refocus the terminal, repeat — now it fires.
 
 ## Troubleshooting
 
-- **Nothing happens on F9 or hey-jarvis.** `Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" | Where-Object CommandLine -match ptt_daemon`. If it's gone, run `.\installers\start_services.ps1`. If it keeps dying, run it in the foreground (see "Running the daemon interactively") to see the exception.
-- **Wake word never fires.** Speak louder/closer, or drop `WAKE_THRESHOLD` to 0.3 in `ptt/config.py`. Restart daemon.
-- **Wake word fires on every word.** Raise `WAKE_THRESHOLD` to 0.7. Or switch wake model via `WAKE_MODEL` env var (installed: `alexa_v0.1`, `hey_mycroft_v0.1`, `hey_rhasspy_v0.1`, `hey_jarvis_v0.1`, `ok_nabu_v0.1`).
-- **Wake records forever.** Tune `EOU_ENERGY_THRESHOLD` in `ptt/config.py` (default 450 int16 RMS).
-- **F9 or wake-word does nothing, daemon log says `suppressed: focus is ...`.** The focus gate rejected the trigger because no `claude.exe` is a descendant of the foreground window. Focus a terminal running `claude`, or override the gate: `PTT_REQUIRE_APPS="claude.exe,codex.exe"` (add apps) or `PTT_REQUIRE_APPS=any` (disable entirely). Restart the daemon after changing env vars.
-- **Typed text lands in the wrong window.** Don't Alt-Tab while the daemon is transcribing — the recorder re-checks focus just before typing and will drop the transcript if focus has shifted, but brief overlaps can still sneak through.
-- **Claude Code Stop hook doesn't fire.** `--plugin-dir` loads commands/skills but doesn't activate plugin hooks in current Claude Code — the installer inlines the same hook into `~/.claude/settings.json` so it fires either way. Verify with `$null | claude --plugin-dir ... --include-hook-events --output-format=stream-json --verbose -p "hi"` and look for a `hook_response` event.
-- **Kokoro plays nothing.** `speak.py`'s Stop-hook path expects `last_assistant_message` in the payload, but Claude Code's headless `-p` mode omits it. `speak.py` falls back to reading `transcript_path` — verify it's readable.
-- **Kokoro service takes ~30-60 s to come healthy.** That's MIOpen JIT-compiling an LSTM kernel per representative sequence length during startup warmup. Subsequent starts are faster because MIOpen's cache survives.
-- **TTS sounds raspy / has tinnitus hiss at the start.** You've enabled `torch.compile` via `KOKORO_COMPILE=1` — the `mode="reduce-overhead"` path on ROCm 7.2 corrupts RNN output. Unset the env var and restart.
-- **`speak.py` takes ~2 s even for short text.** Make sure it's hitting `http://127.0.0.1:13306` not `http://localhost:13306`. On Windows, `localhost` does an IPv6-first DNS resolution with ~2 s of IPv6-fallback penalty on a fresh TCP connection. Since `speak.py` runs as a short-lived subprocess per Claude turn, it pays that cost every time.
-- **kokoro_server log says `Compiler: cl is not found` / `Failed to find MSVC`.** Only matters if you've turned compile on — `run_kokoro.ps1` sources `vcvars64.bat` before launching so Triton-Windows can build compiled kernels. If you moved Visual Studio, edit `VsVcVars` in `installers/run_kokoro.ps1.tmpl` and re-run the installer.
+- **F9 does nothing.** `Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object CommandLine -match ptt_daemon`. If empty, run `.\installers\start_services.ps1`. If it keeps dying, run interactively (see above) to see the traceback.
+- **Wake word misses on clean utterances.** Speak a touch more clearly or check the log:
+  ```powershell
+  Get-Content "$env:LOCALAPPDATA\voice-plugin\logs\ptt-*.log" -Tail 5 -Wait
+  ```
+  Every attempt logs `whisper: <ms> -> '<transcript>'` — if you see the transcript and the regex just didn't match, widen `WAKE_PHRASE`. If you see `no speech detected` / no transcript lines at all, `EOU_ENERGY_THRESHOLD` is too high; drop it (default 450 → try 300).
+- **Wake word fires on random conversation.** The regex is anchored at the start (`^`), so this shouldn't happen — if it does, the transcript is genuinely starting with something that matches. Tighten `WAKE_PHRASE`: e.g., require `hey\s+halo` (no "hey" optionality, no close phonetic variants).
+- **STT mis-transcribes ("current time" → "occurrent time").** You're probably on Whisper-Small. Pull Whisper-Large-v3-Turbo (see bootstrap step 5) and set `$env:WHISPER_MODEL = "Whisper-Large-v3-Turbo"`.
+- **STT text lands in the wrong window.** Don't Alt-Tab while transcribing. The focus gate re-checks right before typing and will drop the transcript if focus has drifted, but brief overlaps can still sneak through.
+- **Stop hook doesn't fire in Claude Code.** `--plugin-dir` loads commands but doesn't activate plugin hooks in current Claude Code. The installer inlines the same hook into `~/.claude/settings.json` so it fires regardless. If it still doesn't: `Get-Content ~/.claude/settings.json | Select-String "speak.py"` — the inline Stop hook should be there. If not, re-run `installers\install_windows.ps1`.
+- **`speak.py` takes ~2 s of HTTP connect time per turn.** Make sure `TTS_URL` uses `127.0.0.1`, not `localhost`. Windows tries IPv6 first and eats ~2 s on the fallback for short-lived connections.
+- **TTS plays nothing.** Check the `speak.py` audit log in `%LOCALAPPDATA%\voice-plugin\logs\speak.log` and Lemonade's logs. Common causes: no default audio output device, or `TTS_URL` pointing at a service that isn't running.
+- **F5-TTS takes minutes to start the first time.** It downloads ~2 GB of weights from HuggingFace on first launch (Vocos + F5-TTS Base). Subsequent starts are ~5 s.
 
-## Known divergences from PLAN.md
+## Architecture decisions / trade-offs
 
-- **Lemonade is built from source, not pip-installed.** `lemonade-sdk` 9.1.4 on PyPI deprecated its Python server and dropped the Kokoro TTS backend; Kokoro only lives in the C++ server (`lemond`). We submodule and build it ourselves.
-- **Whisper is on the GPU.** PLAN called for CPU whisper-server (Lemonade's bundled binary). We build whisper.cpp with HIP targeting gfx1201, overlay the latest ggml from llama.cpp at build time (whisper.cpp's embedded ggml lags), and point Lemonade at our binary via `whispercpp.cpu_bin`. 27× real-time.
-- **Kokoro is on the GPU** — not via ONNX. We run hexgrad/Kokoro-82M in eager PyTorch with MIOpen LSTM on gfx1201, inside `ptt/kokoro_server.py` on `:13306`, and point `speak.py` at it. Avoids DirectML and Lemonade's CPU Kokoro entirely. Roughly on par with CPU Kokoro for short text, ~2× faster for long text. `torch.compile` is installed and wireable but off by default — the `mode="reduce-overhead"` CUDA-graph path corrupts RNN output on ROCm 7.2 (tinnitus artifacts, raspy timbre). Re-enable with `KOKORO_COMPILE=1` if you want to experiment.
-- **TheRock PyTorch + triton-windows** drive Kokoro and provide the HIP SDK (amdclang-cl, hipcc, hipblas, rocblas, rocwmma) we compile whisper.cpp against. Triton is still present in case we ever fix the compile path; the Kokoro service warmup just doesn't trigger it today.
-- **Hooks use `"shell": "powershell"`** — no `.sh`/`.cmd` launcher dance. See [Claude Code hooks docs](https://docs.claude.com/en/docs/claude-code/hooks).
-- **Stop hook lives in `~/.claude/settings.json`, not just in `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks; inline in `settings.json` fires in both `--plugin-dir` dev mode and `/plugin install` prod mode.
-- **Wake word is Phase 1.5 (new).** `openwakeword` (Apache 2.0, pure onnxruntime, bundled Silero VAD).
-- **Focus gate (new)** — F9 / wake only fire when a `claude.exe` process lives under the foreground window. The recorder also re-checks just before typing to protect against focus drift during Whisper's ~150 ms roundtrip.
-- **Venv at workspace root** (`.\.venv`), not `%USERPROFILE%\venvs\voice`. Installer bakes the venv python path into the shims.
-- **Flash attention disabled at runtime.** Compiled in but `whispercpp.args=-nfa` in Lemonade config — rocWMMA FA on gfx1201 produces garbled output today.
+- **Whisper-based wake word instead of a keyword-spotter.** The original design used openWakeWord ("hey jarvis"), but that limited us to its 5 pre-trained phrases unless we trained a custom model. Reusing the Whisper STT we already run — transcribe each energy-gated speech burst, regex-match the transcript — lets us change the wake phrase to anything with one env var. Cost: one Whisper call per utterance vs. openWakeWord's per-frame inference, but Whisper only runs when someone's actually speaking, so amortized load is modest.
+- **Lemonade CPU Kokoro as default TTS.** It's already running for STT, so there's zero additional service to start. Latency is a few hundred ms per sentence on a modern CPU, which is fine for Claude Code's typical reply length. F5-TTS on GPU is faster for long outputs and available opt-in.
+- **F5-TTS over our custom `kokoro_server` as the GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py`) for experimentation but isn't default.
+- **Focus gate.** F9 and wake only fire when a `claude.exe` process lives under the foreground window (or when a known terminal-hosting process like Windows Terminal is focused and `claude` is running anywhere on the system). The recorder re-checks just before typing to handle focus drift during Whisper's round-trip.
+- **Stop hook lives in `~/.claude/settings.json`, not just `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks. The installer merges the Stop hook inline so it fires in both `--plugin-dir` and `/plugin install` modes.
+- **Venv at workspace root (`.\.venv`).** The installer bakes the venv Python path into the shims, so the daemon always uses the right interpreter.
+- **Flash attention disabled at runtime.** `whispercpp.args=-nfa` in Lemonade's config — the rocWMMA FA path produces garbled output on gfx1201 today. Non-FA ROCm is still 24× faster than CPU so we live with it.
 
 ## Build / runtime notes
 
-- **Windows CMake + cpp-httplib** fails out of the box on recent Windows 11 builds because it reads `CMAKE_SYSTEM_VERSION` as 6.2 (Windows 8) and bails. Both our build scripts pass `-DCMAKE_SYSTEM_VERSION="10.0.26100.0"` to work around this.
-- **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`%VENV%\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for BOTH C and CXX to match compiler families (cl-driver). Mixing with hipcc (GNU-driver) trips CMake's same-family check.
-- **ggml overlay** happens automatically each time `build_whisper_hip.cmd` runs: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. Nothing in the whisper.cpp submodule gets committed — the overlay is a build-time step.
-- **PATH order for kokoro_server runtime.** `run_kokoro.ps1` sets `$env:PATH = "$RocmBin;" + $env:PATH` from PowerShell _before_ spawning cmd, then cmd `call`s vcvars64.bat. Doing it the other way around (cmd: `call vcvars64.bat && set PATH=X;%PATH%`) silently clobbers the MSVC additions because cmd expands `%PATH%` at parse time, before vcvars ever runs.
-- **`torch.compile(mode="reduce-overhead")` uses CUDA graphs** — these must all execute on the same thread. FastAPI's default threadpool hops threads per request, so the Kokoro service funnels all inference through a single dedicated worker thread via a `Queue`.
-- **cudnn off on ROCm** — MIOpen's LSTM kernels for batch=1 / short sequences are significantly slower than `aten` + Triton. `KOKORO_DISABLE_CUDNN=0` to re-enable if you want to test.
+- **CMake on Windows 11 misreads `CMAKE_SYSTEM_VERSION` as 6.2** with recent Windows SDKs via `cpp-httplib`. Both our build scripts pass `-DCMAKE_SYSTEM_VERSION="10.0.26100.0"` explicitly.
+- **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`%VENV%\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for both C and CXX to match compiler families. Mixing with hipcc (GNU-driver) trips CMake's same-family check.
+- **ggml overlay** happens automatically on each `build_whisper_hip.cmd` run: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. No submodule files get committed; the overlay is a build-time step.
+- **`cudnn`/MIOpen stays on.** MIOpen is the accuracy-preserving path on ROCm; `torch.backends.cudnn.enabled = False` swaps in an `aten::lstm` fallback that's numerically different and produces worse-sounding audio on this stack.
 
 ## Out of scope (v1)
 
-- Custom "hey claude" wake word (~1 hr Colab training per openWakeWord docs).
-- Streaming TTS (speaking sentence-by-sentence as Claude writes). Claude Code's `--include-partial-messages` exposes text deltas over stream-json; wiring those into Kokoro + playback queue is a follow-up.
+- Streaming TTS (speaking sentence-by-sentence as Claude writes). Claude Code's `--include-partial-messages` exposes text deltas over stream-json; wiring those into the TTS backend is a follow-up.
 - ROCm flash attention that actually works on gfx1201.
-- TTS barge-in (wake listener stays muted during Kokoro via `tts_active.lock` but doesn't actively interrupt).
-- Alt-tab during recording.
+- TTS barge-in — the wake listener stays muted during TTS via `tts_active.lock` but doesn't actively cut off playback.
+- Multi-window/multi-session support — one `claude.exe` at a time.
 - Languages other than English.
 
 ## Uninstall
@@ -265,4 +292,4 @@ After `start_services.ps1`:
 .\installers\uninstall_windows.ps1
 ```
 
-Removes any Task Scheduler entries, `%USERPROFILE%\.claude\plugins\voice\`, and `%LOCALAPPDATA%\voice-plugin\` (which includes the Triton cache and logs). `~/.claude/settings.json` is left alone — edit it if you want to drop the permission allowlist and Stop hook entries. The `.venv` and `vendor/` build outputs in the workspace are untouched.
+Removes any Task Scheduler entries, `%USERPROFILE%\.claude\plugins\voice\`, and `%LOCALAPPDATA%\voice-plugin\` (including logs and any cached TTS artifacts). `~/.claude/settings.json` is left alone — edit it by hand if you want to drop the permission allowlist and Stop hook entries. The `.venv` and `vendor/` build outputs in the workspace are untouched.

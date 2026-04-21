@@ -118,6 +118,9 @@ if (-not (Test-Path $RocmBin)) { $RocmBin = "" }
 $WhisperDir = Join-Path $WorkspaceRoot "vendor\whisper-cpp-rocm"
 if (-not (Test-Path $WhisperDir)) { $WhisperDir = "" }
 
+$WhisperExe = if ($WhisperDir) { Join-Path $WhisperDir "whisper-server.exe" } else { "" }
+if ($WhisperExe -and -not (Test-Path $WhisperExe)) { $WhisperExe = "" }
+
 Render-Template `
     (Join-Path $WorkspaceRoot "installers\run_lemonade.ps1.tmpl") `
     (Join-Path $ShimDir "run_lemonade.ps1") `
@@ -125,6 +128,7 @@ Render-Template `
         "__LEMOND_EXE__"   = $LemondExe
         "__ROCM_BIN__"     = $RocmBin
         "__WHISPER_DIR__"  = $WhisperDir
+        "__WHISPER_EXE__"  = $WhisperExe
     }
 
 Render-Template `

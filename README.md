@@ -2,7 +2,7 @@
 
 Local STT, wake word, and TTS for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows 11. Everything runs on your own machine — no cloud.
 
-- **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp (Whisper-Large-v3-Turbo, ~27× real-time on a 9070 XT with gfx1201).
+- **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp. On a 9070 XT (gfx1201) with Whisper-Large-v3-Turbo, transcribes 37.8 s of speech in ~460 ms steady-state — 80× realtime. Requires a patched Lemonade (our `jam/windows-rocm-whisper` submodule branch) because upstream Lemonade only wires CPU / NPU / Vulkan for whispercpp.
 - **Wake word ("hey halo" by default)** — no custom keyword-spotter. Every energy-gated speech burst gets transcribed by Whisper; the transcript is typed only if it starts with the configured wake phrase. Changing the wake phrase is a single env var.
 - **TTS via Lemonade's bundled CPU Kokoro** by default. A pure-eager-PyTorch GPU backend ([F5-TTS on ROCm](#optional-f5-tts-on-gpu)) is available opt-in via `VOICE_TTS=f5`.
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
@@ -57,7 +57,11 @@ If you're another Claude agent picking up this codebase, read this whole section
 │   ├── build_lemonade_cpp.cmd    builds lemond.exe (Lemonade C++ server)
 │   └── build_whisper_hip.cmd     builds whisper-server.exe (ROCm/gfx1201)
 └── deps/                         git submodules
-    ├── lemonade/                 lemonade-sdk/lemonade (tag v10.2.0)
+    ├── lemonade/                 lemonade-sdk/lemonade on our
+    │                             jam/windows-rocm-whisper branch —
+    │                             adds a ROCm backend for whispercpp
+    │                             that upstream doesn't have. See
+    │                             "Build / runtime notes" below.
     ├── whisper.cpp/              ggml-org/whisper.cpp
     └── llama.cpp/                ggml-org/llama.cpp (ggml overlay source)
 
@@ -222,6 +226,20 @@ $env:WHISPER_MODEL = "Whisper-Small"   # faster, less accurate
 $env:WHISPER_MODEL = "Whisper-Medium"  # middle ground
 ```
 
+**Whispercpp backend** (used by `lemond.exe` internally — set in `installers/run_lemonade.ps1.tmpl`):
+
+```powershell
+# defaults baked into the shim:
+$env:LEMONADE_WHISPERCPP          = "rocm"
+$env:LEMONADE_WHISPERCPP_ROCM_BIN = "D:\jam\demos\vendor\whisper-cpp-rocm\whisper-server.exe"
+$env:LEMONADE_WHISPERCPP_ARGS     = "-nfa"   # disables flash-attention (rocWMMA FA is wrong on gfx1201)
+
+# override to switch back to CPU-only STT:
+$env:LEMONADE_WHISPERCPP = "cpu"
+```
+
+Heads-up: Lemonade caches its resolved config at `%USERPROFILE%\.cache\lemonade\config.json` on first boot and only re-reads env vars if that file doesn't exist. If you change `LEMONADE_WHISPERCPP*` and don't see the change take effect, delete the cached `config.json` and restart.
+
 **STT hints** — the daemon passes `language=en` and a short context prompt ("The user is talking to an AI coding assistant...") to bias Whisper toward technical vocabulary. Override with `WHISPER_LANGUAGE=""` / `WHISPER_PROMPT=""` to disable either.
 
 **Auto-submit** — Enter is pressed after typing. `PTT_AUTO_SUBMIT=0` to disable.
@@ -273,6 +291,8 @@ After `start_services.ps1`:
 
 ## Build / runtime notes
 
+- **Patched Lemonade fork for ROCm whisper.** The `deps/lemonade` submodule is pinned to our branch (`jam/windows-rocm-whisper`) which adds a `rocm` option to the `whispercpp` backend dispatch. Four surgical edits over upstream: registering the backend in `system_info.cpp`'s recipe table, an accept-`rocm` branch in `whisper_server.cpp` (plus a no-op `get_install_params` case so external binaries short-circuit the github download), two new env-var mappings in `config_file.cpp` (`LEMONADE_WHISPERCPP_ROCM_BIN` + `LEMONADE_WHISPERCPP_VULKAN_BIN`), and `rocm_bin`/`vulkan_bin` defaults in `resources/defaults.json`. If you re-init submodules you'll lose this — keep the branch.
+- **Lemonade config.json is cached on first boot.** Env vars like `LEMONADE_WHISPERCPP_*` are only read into `%USERPROFILE%\.cache\lemonade\config.json` the first time lemond runs. If you later change a shim env var and it doesn't take effect, delete that file and restart.
 - **CMake on Windows 11 misreads `CMAKE_SYSTEM_VERSION` as 6.2** with recent Windows SDKs via `cpp-httplib`. Both our build scripts pass `-DCMAKE_SYSTEM_VERSION="10.0.26100.0"` explicitly.
 - **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`%VENV%\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for both C and CXX to match compiler families. Mixing with hipcc (GNU-driver) trips CMake's same-family check.
 - **ggml overlay** happens automatically on each `build_whisper_hip.cmd` run: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. No submodule files get committed; the overlay is a build-time step.

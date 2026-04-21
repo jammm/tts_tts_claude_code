@@ -20,17 +20,14 @@ TRANSCRIBE_ENDPOINT = f"{LEMONADE_URL}/api/v1/audio/transcriptions"
 # variant (Whisper-Small / Whisper-Base) if you want faster STT at the
 # cost of accuracy.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Whisper-Large-v3-Turbo")
-# Force-English decoding + a short context prompt that biases Whisper
-# toward the vocabulary of a developer talking to an AI assistant. Leave
-# WHISPER_PROMPT empty to disable. The prompt never ends up in the
-# transcription output — Whisper uses it only as a conditioning hint.
+# Force-English decoding. Leave WHISPER_PROMPT empty by default: on
+# short or quiet clips Whisper will echo the prompt into the transcript
+# (hallucination), which tanks wake-phrase matching because the
+# transcription becomes the context sentence instead of whatever the
+# user said. Set your own prompt if you have clean audio and want the
+# domain bias.
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
-WHISPER_PROMPT = os.environ.get(
-    "WHISPER_PROMPT",
-    "The user is talking to an AI coding assistant. They may mention "
-    "programming terms, file names, commands, or ask about code, tests, "
-    "builds, and deployment.",
-)
+WHISPER_PROMPT = os.environ.get("WHISPER_PROMPT", "")
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -70,7 +67,20 @@ WAKE_COOLDOWN_SECONDS = 2.0
 # yet, no point recording).
 EOU_SILENCE_MS = 800
 EOU_MAX_RECORDING_MS = 10_000
-EOU_ENERGY_THRESHOLD = 450  # int16 RMS; tuned by ear — lower = more sensitive
+# int16 RMS. Tunable vs room noise — higher rejects more background,
+# lower picks up quieter speech. 350 is the middle ground between
+# catching soft "hey halo" and not firing on ambient HVAC / keyboard
+# clicks (each of which Whisper then hallucinates into stock phrases
+# like "Thank you." or "All right.").
+EOU_ENERGY_THRESHOLD = int(os.environ.get("EOU_ENERGY_THRESHOLD", "350"))
+
+# Whisper hallucinates badly on clips under ~1 s — 300-700 ms of audio
+# typically decodes to one of a few stock phrases ("Thank you.", "All
+# right.", "Bye.", "You."). Drop anything shorter and pad still-short
+# clips up to MIN_PAD_MS total by wrapping them in silence, which
+# regularizes Whisper's 30 s attention window for short inputs.
+MIN_CLIP_MS = int(os.environ.get("MIN_CLIP_MS", "700"))
+MIN_PAD_MS = int(os.environ.get("MIN_PAD_MS", "2000"))
 
 
 # Cross-process signal: speak.py touches this file while Kokoro is

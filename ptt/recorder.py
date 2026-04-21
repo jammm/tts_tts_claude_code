@@ -131,9 +131,21 @@ class Recorder:
             audio.size,
             duration_ms,
         )
-        if duration_ms < 300:
-            log.info("skipping transcribe, clip too short")
+        if duration_ms < config.MIN_CLIP_MS:
+            log.info("skipping transcribe, clip too short (%.0f ms < %d)",
+                     duration_ms, config.MIN_CLIP_MS)
             return
+        # Pad still-short clips with silence on both sides so Whisper's
+        # 30 s attention window gets something structurally resembling a
+        # normal utterance. Without this, 0.8-1.5 s clips routinely
+        # decode to stock phrases like "Thank you." instead of the
+        # actual words.
+        if duration_ms < config.MIN_PAD_MS:
+            pad_samples = int(
+                (config.MIN_PAD_MS - duration_ms) * config.SAMPLE_RATE / 1000 / 2
+            )
+            silence = np.zeros(pad_samples, dtype=np.int16)
+            audio = np.concatenate([silence, audio, silence])
         try:
             text = _transcribe(audio)
         except Exception:
@@ -150,7 +162,15 @@ class Recorder:
                 # for us. Silent drop (info-level log for debugging).
                 log.info("whisper wake: no match in %r, dropping", text[:80])
                 return
-            command = text[m.end():].lstrip(" ,.:;!?-").strip()
+            # Short utterances sometimes make Whisper repeat the same
+            # sentence with slightly different punctuation/wording, so
+            # the raw "after the first match" slice can end up like
+            # "what's the time?\n Hey Halo, what's the time?". Split on
+            # newline first and keep only the first line, then strip
+            # leading punctuation that the wake phrase left behind.
+            command = text[m.end():]
+            command = command.split("\n", 1)[0]
+            command = command.lstrip(" ,.:;!?-").strip()
             if not command:
                 log.info("whisper wake: matched %r but no command after", text)
                 return

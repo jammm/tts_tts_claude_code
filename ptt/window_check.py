@@ -1,13 +1,21 @@
 """Foreground-window gate for the PTT daemon.
 
 Both F9 and the wake-word listener consult ``focus_passes_gate()`` before
-recording. Returns True only when the focused window is hosting one of the
-allowed processes (default: ``claude.exe``) — that is, ``claude.exe`` is a
-descendant of the foreground window's process.
+recording. Returns True when either:
+
+1. ``claude.exe`` is a strict descendant of the foreground window's
+   process — works when you're running claude in a shell that IS the
+   foreground window (e.g. Cursor's integrated terminal, a plain PowerShell
+   window), OR
+2. The foreground window is a known terminal / editor host AND any
+   ``claude.exe`` is alive anywhere on the system. Windows Terminal in
+   particular breaks the direct-descendant chain because ConPTY spawns
+   shells as children of ``OpenConsole.exe`` rather than of
+   ``WindowsTerminal.exe``.
 
 Rationale: STT that types into random windows is a footgun. Gating on Claude
 Code's presence ensures transcriptions land in the terminal where Claude is
-running, not the browser or Slack that happens to be focused.
+running, not in the browser or Slack that happens to be focused.
 
 Override via env:
   ``PTT_REQUIRE_APPS="claude.exe,codex.exe"`` — comma-separated allow-list.
@@ -27,6 +35,27 @@ import psutil
 log = logging.getLogger(__name__)
 
 _DEFAULT_REQUIRED_APPS = ("claude.exe",)
+
+# Terminal / IDE hosts whose presence in the foreground counts as "user is
+# probably interacting with a shell". On Windows Terminal the foreground
+# window is WindowsTerminal.exe but child shells actually live under
+# OpenConsole.exe, so a strict descendant check misses them. For these hosts
+# we allow the gate to pass as long as SOME required-app process exists on
+# the system.
+_KNOWN_TERMINAL_HOSTS = frozenset({
+    "windowsterminal.exe",
+    "openconsole.exe",
+    "conhost.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "cursor.exe",
+    "code.exe",
+    "alacritty.exe",
+    "wezterm.exe",
+    "wezterm-gui.exe",
+    "mintty.exe",
+})
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.GetForegroundWindow.restype = wintypes.HWND
@@ -69,8 +98,17 @@ def _is_descendant_of(pid: int, ancestor_pid: int) -> bool:
     return False
 
 
+def _foreground_process_name(fg_pid: int) -> str:
+    try:
+        return psutil.Process(fg_pid).name().lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return ""
+
+
 def focus_passes_gate() -> bool:
-    """Is any required app a descendant of the foreground window's process?"""
+    """Either ``claude.exe`` descends directly from the foreground window,
+    or the foreground is a known terminal/editor host and some
+    ``claude.exe`` is alive somewhere on the system."""
     apps = _required_apps()
     if not apps or _gate_disabled(apps):
         return True
@@ -78,13 +116,26 @@ def focus_passes_gate() -> bool:
     if fg_pid == 0:
         log.debug("focus gate: no foreground window")
         return False
+
     apps_set = {a.lower() for a in apps}
-    for proc in psutil.process_iter(["name", "pid"]):
-        name = (proc.info.get("name") or "").lower()
-        if name not in apps_set:
-            continue
+    claude_processes = [
+        p for p in psutil.process_iter(["name", "pid"])
+        if (p.info.get("name") or "").lower() in apps_set
+    ]
+    if not claude_processes:
+        return False
+
+    # Strict: any claude.exe descended from the foreground window?
+    for proc in claude_processes:
         if _is_descendant_of(proc.pid, fg_pid):
             return True
+
+    # Permissive: foreground is a known terminal/editor host AND claude
+    # runs somewhere. This rescues Windows Terminal, whose ConPTY model
+    # breaks the direct descendant chain.
+    if _foreground_process_name(fg_pid) in _KNOWN_TERMINAL_HOSTS:
+        return True
+
     return False
 
 

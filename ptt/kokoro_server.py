@@ -39,12 +39,18 @@ os.environ.setdefault("MIOPEN_LOG_LEVEL", "0")
 
 from kokoro import KPipeline  # noqa: E402 (after env var)
 
-# On ROCm 7.2 MIOpen's LSTM kernels are a lot slower than PyTorch's native
-# RNN path for the tiny batch=1/short-seq shapes Kokoro hits per request.
-# Disable cudnn/MIOpen RNN so torch.nn.LSTM falls back to aten, which we
-# can then torch.compile into fast Triton kernels.
-if os.environ.get("KOKORO_DISABLE_CUDNN", "1") == "1":
+# Keep cuDNN/MIOpen enabled — the aten LSTM fallback produces numerically
+# degraded audio on ROCm 7.2 (tinnitus-like high-frequency artifacts at
+# utterance starts, raspy timbre on voiced sustain). MIOpen's LSTM path is
+# slightly slower but preserves the model's original precision.
+# Set KOKORO_DISABLE_CUDNN=1 if you want to experiment.
+if os.environ.get("KOKORO_DISABLE_CUDNN", "0") == "1":
     torch.backends.cudnn.enabled = False
+
+# Use full float32 for matmul (default is "highest"; confirm explicitly to
+# defeat any global config that would downgrade precision for RNN-adjacent
+# operations).
+torch.set_float32_matmul_precision("highest")
 
 log = logging.getLogger("kokoro_server")
 
@@ -53,6 +59,10 @@ LANG_CODE = os.environ.get("KOKORO_LANG", "a")
 DEFAULT_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
 DEVICE = os.environ.get("KOKORO_DEVICE", "cuda")
 SAMPLE_RATE = 24_000
+# hexgrad/Kokoro-82M peaks at ~0.19 for normal speech; Lemonade's Kokoros
+# ONNX export peaks at ~0.48 for the same text. Match that with a peak
+# normalize so the user doesn't need to crank the volume to compare.
+TARGET_PEAK = float(os.environ.get("KOKORO_TARGET_PEAK", "0.5"))
 
 
 class SpeechRequest(BaseModel):
@@ -94,17 +104,13 @@ class KokoroService:
         log.info("Kokoro load: %.1f s", time.monotonic() - t0)
         self._lock = threading.Lock()
 
-        if device == "cuda" and os.environ.get("KOKORO_COMPILE", "1") == "1":
-            # torch.compile the forward pass with Triton on ROCm. We wrap
-            # only `.forward` (not the whole module) so KPipeline's
-            # truthy check `if model and ...` keeps working — wrapping the
-            # module would give an OptimizedModule whose `__len__` raises.
-            #
-            # mode="reduce-overhead" captures CUDA graphs, which require
-            # all work to run on the same thread / stream. A dedicated
-            # worker thread (see _worker_loop) gives us that invariant;
-            # without it the uvicorn threadpool hops threads per request
-            # and hipblaslt rejects "stream is capturing" operations.
+        # torch.compile is off by default. On ROCm 7.2 with gfx1201, the
+        # reduce-overhead CUDA-graph path produces audibly broken output:
+        # tinnitus-like high-frequency hiss at utterance starts and a
+        # hoarse/raspy timbre on sustained voiced content. Eager mode
+        # preserves the model's native precision. Opt into compile via
+        # KOKORO_COMPILE=1 if you want to experiment (quality will suffer).
+        if device == "cuda" and os.environ.get("KOKORO_COMPILE", "0") == "1":
             log.info("torch.compile(dynamic=True, mode=reduce-overhead) on KModel.forward...")
             try:
                 self._pipeline.model.forward = torch.compile(
@@ -176,6 +182,12 @@ class KokoroService:
         if not chunks:
             return b""
         joined = np.concatenate(chunks)
+        # Peak-normalize so clients don't have to crank the volume. The
+        # raw PyTorch checkpoint outputs ~2.5x quieter than Lemonade's
+        # Kokoros ONNX export for the same text.
+        peak = float(np.max(np.abs(joined)))
+        if TARGET_PEAK > 0 and peak > 0:
+            joined = joined * (TARGET_PEAK / peak)
         buf = io.BytesIO()
         sf.write(buf, joined, SAMPLE_RATE, subtype="PCM_16", format="WAV")
         return buf.getvalue()

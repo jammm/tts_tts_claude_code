@@ -172,18 +172,24 @@ Flash attention compiled in but runtime-disabled (`-nfa`): the rocWMMA FA path p
 
 ### TTS (Kokoro-82M)
 
-| text | **GPU (ROCm+Triton)** | CPU (Lemonade ONNX) | speedup |
-|---|---|---|---|
-| "Hello." | **94 ms** (14.4× realtime) | 391 ms | 4.2× |
-| short sentence | **218 ms** (14.9× realtime) | 656 ms | 3.0× |
-| medium | **250 ms** (18.5× realtime) | 781 ms | 3.1× |
-| long (9.65 s audio) | **407 ms** (23.7× realtime) | 1282 ms | 3.2× |
+Runs on the 9070 XT in **eager PyTorch** (no `torch.compile`) with MIOpen driving the LSTM path. `torch.compile(mode="reduce-overhead")` initially gave a 3-4× speedup but the CUDA-graph path produces audible artifacts on ROCm 7.2 (tinnitus hiss at utterance start, hoarse voiced sustain), so we turned it off. Set `KOKORO_COMPILE=1` to opt in if you want the speedup and don't mind the quality loss.
 
-Kokoro on the GPU needs the four knobs all at once to be this fast:
-1. `torch.compile(... mode="reduce-overhead")` on `KModel.forward` (not the whole module — that breaks KPipeline's truthy check).
-2. A single dedicated inference worker thread so `torch.compile`'s CUDA graphs aren't invalidated by uvicorn's thread pool.
-3. `torch.backends.cudnn.enabled = False` so aten + Triton handles the LSTM instead of MIOpen (MIOpen's LSTM kernels on ROCm 7.2 are much slower at batch=1 / short sequence).
-4. Clients must hit `http://127.0.0.1` rather than `http://localhost` — the Windows DNS resolver tries `::1` first and falls back to IPv4 on connection refused, eating ~2 s per fresh connection. `speak.py` is a short-lived subprocess per turn so it never benefits from HTTP keep-alive.
+Eager-mode latencies, warm, over `http://127.0.0.1`:
+
+- "Hello." → ~0.5-1 s
+- 9.65 s of audio from a long sentence → ~1.5-2 s
+
+Still faster than real-time for any Claude reply length, just not as dramatically as the compiled path. Compared to the CPU Kokoro baseline:
+
+- GPU eager is ~2× faster than CPU for long text.
+- For short text the two are roughly equivalent.
+
+Gotchas we ran into getting this to work correctly:
+
+1. **Wrap only `KModel.forward`, not the whole module** — wrapping the module breaks KPipeline's truthy check (`if model and ...` calls `__len__` on OptimizedModule which raises).
+2. **Single dedicated inference worker thread** — when we were using `torch.compile`'s CUDA graphs, uvicorn's threadpool hopping invalidated them. The dedicated worker is harmless with eager too and keeps the path simple.
+3. **Clients must hit `http://127.0.0.1` rather than `http://localhost`** — the Windows DNS resolver tries `::1` first and falls back to IPv4 on connection refused, eating ~2 s per fresh connection. `speak.py` is a short-lived subprocess per turn so it never benefits from HTTP keep-alive.
+4. **Peak-normalize** to match Lemonade's ONNX amplitude. hexgrad/Kokoro-82M outputs ~2.5× quieter than `mikkoph/kokoro-onnx`, which perceptually reads as "muffled". Tunable via `KOKORO_TARGET_PEAK` (default 0.5).
 
 ### Wake word
 
@@ -217,16 +223,17 @@ After `start_services.ps1`:
 - **Typed text lands in the wrong window.** Don't Alt-Tab while the daemon is transcribing — the recorder re-checks focus just before typing and will drop the transcript if focus has shifted, but brief overlaps can still sneak through.
 - **Claude Code Stop hook doesn't fire.** `--plugin-dir` loads commands/skills but doesn't activate plugin hooks in current Claude Code — the installer inlines the same hook into `~/.claude/settings.json` so it fires either way. Verify with `$null | claude --plugin-dir ... --include-hook-events --output-format=stream-json --verbose -p "hi"` and look for a `hook_response` event.
 - **Kokoro plays nothing.** `speak.py`'s Stop-hook path expects `last_assistant_message` in the payload, but Claude Code's headless `-p` mode omits it. `speak.py` falls back to reading `transcript_path` — verify it's readable.
-- **Kokoro service takes 90 s to come healthy.** That's the first-run torch.compile + Triton JIT warmup (one kernel per representative sequence length). Compile artifacts persist at `%LOCALAPPDATA%\voice-plugin\triton-cache\` so subsequent starts are 20-30 s. Nuke that directory if the cache gets poisoned.
+- **Kokoro service takes ~30-60 s to come healthy.** That's MIOpen JIT-compiling an LSTM kernel per representative sequence length during startup warmup. Subsequent starts are faster because MIOpen's cache survives.
+- **TTS sounds raspy / has tinnitus hiss at the start.** You've enabled `torch.compile` via `KOKORO_COMPILE=1` — the `mode="reduce-overhead"` path on ROCm 7.2 corrupts RNN output. Unset the env var and restart.
 - **`speak.py` takes ~2 s even for short text.** Make sure it's hitting `http://127.0.0.1:13306` not `http://localhost:13306`. On Windows, `localhost` does an IPv6-first DNS resolution with ~2 s of IPv6-fallback penalty on a fresh TCP connection. Since `speak.py` runs as a short-lived subprocess per Claude turn, it pays that cost every time.
-- **kokoro_server log says `Compiler: cl is not found` / `Failed to find MSVC`.** `run_kokoro.ps1` must source `vcvars64.bat` before launching the server so Triton-Windows can build its compiled kernels. If you moved Visual Studio, edit `VsVcVars` in `installers/run_kokoro.ps1.tmpl` and re-run the installer.
+- **kokoro_server log says `Compiler: cl is not found` / `Failed to find MSVC`.** Only matters if you've turned compile on — `run_kokoro.ps1` sources `vcvars64.bat` before launching so Triton-Windows can build compiled kernels. If you moved Visual Studio, edit `VsVcVars` in `installers/run_kokoro.ps1.tmpl` and re-run the installer.
 
 ## Known divergences from PLAN.md
 
 - **Lemonade is built from source, not pip-installed.** `lemonade-sdk` 9.1.4 on PyPI deprecated its Python server and dropped the Kokoro TTS backend; Kokoro only lives in the C++ server (`lemond`). We submodule and build it ourselves.
 - **Whisper is on the GPU.** PLAN called for CPU whisper-server (Lemonade's bundled binary). We build whisper.cpp with HIP targeting gfx1201, overlay the latest ggml from llama.cpp at build time (whisper.cpp's embedded ggml lags), and point Lemonade at our binary via `whispercpp.cpu_bin`. 27× real-time.
-- **Kokoro is on the GPU** — not via ONNX. Lemonade's `koko` backend (Rust/ONNX CPU) was 3-4× slower than what we can do with hexgrad/Kokoro-82M in PyTorch + torch.compile + Triton on gfx1201. We run `ptt/kokoro_server.py` as a separate service on `:13306` and point `speak.py` at it. Avoids DirectML and Lemonade's Kokoro entirely.
-- **TheRock PyTorch + triton-windows** power both the Kokoro service (torch.compile generates Triton kernels for the gfx1201 backend) and provide the HIP SDK (amdclang-cl, hipcc, hipblas, rocblas, rocwmma) we compile whisper.cpp against.
+- **Kokoro is on the GPU** — not via ONNX. We run hexgrad/Kokoro-82M in eager PyTorch with MIOpen LSTM on gfx1201, inside `ptt/kokoro_server.py` on `:13306`, and point `speak.py` at it. Avoids DirectML and Lemonade's CPU Kokoro entirely. Roughly on par with CPU Kokoro for short text, ~2× faster for long text. `torch.compile` is installed and wireable but off by default — the `mode="reduce-overhead"` CUDA-graph path corrupts RNN output on ROCm 7.2 (tinnitus artifacts, raspy timbre). Re-enable with `KOKORO_COMPILE=1` if you want to experiment.
+- **TheRock PyTorch + triton-windows** drive Kokoro and provide the HIP SDK (amdclang-cl, hipcc, hipblas, rocblas, rocwmma) we compile whisper.cpp against. Triton is still present in case we ever fix the compile path; the Kokoro service warmup just doesn't trigger it today.
 - **Hooks use `"shell": "powershell"`** — no `.sh`/`.cmd` launcher dance. See [Claude Code hooks docs](https://docs.claude.com/en/docs/claude-code/hooks).
 - **Stop hook lives in `~/.claude/settings.json`, not just in `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks; inline in `settings.json` fires in both `--plugin-dir` dev mode and `/plugin install` prod mode.
 - **Wake word is Phase 1.5 (new).** `openwakeword` (Apache 2.0, pure onnxruntime, bundled Silero VAD).

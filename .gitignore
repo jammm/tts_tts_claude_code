@@ -5,6 +5,9 @@
 # Build outputs & downloaded artifacts — recreated from tools/build_*.cmd
 vendor/
 
+# GGUF model weights — fetched from huggingface, not committed
+models/
+
 # Submodule build trees (transient)
 deps/*/build/
 deps/*/build-*/

@@ -28,17 +28,27 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 
-# By default we hit Lemonade's CPU Kokoro on :13305 — it's the simplest
-# path (Lemonade is already running for STT, no extra service to start).
-# Override to http://127.0.0.1:13307 for F5-TTS on the GPU (pure-eager
-# PyTorch, no torch.compile recompile cliffs) or :13306 for our custom
-# ROCm Kokoro service.
-# Use 127.0.0.1 rather than localhost: on Windows, name resolution tries
-# IPv6 (::1) first and the failed-then-fallback path adds ~2s per fresh
-# connection. speak.py runs as a short-lived subprocess per Claude turn so
-# it never benefits from connection reuse.
-TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:13305")
-SPEECH_ENDPOINT = f"{TTS_URL}/api/v1/audio/speech"
+# TTS backend selection mirrors start_services.ps1's VOICE_TTS env var:
+#   cpu     -> lemonade CPU Kokoro, :13305/api/v1/audio/speech   (default)
+#   kokoro  -> our ROCm PyTorch Kokoro, :13306/api/v1/audio/speech
+#   f5      -> F5-TTS on GPU,         :13307/api/v1/audio/speech
+#   kobold  -> koboldcpp HIP Kokoro,  :13308/v1/audio/speech      (OpenAI path)
+# Override with TTS_URL/TTS_SPEECH_PATH/TTS_SPEECH_URL if you're running
+# a non-default port or a different backend. 127.0.0.1 instead of
+# localhost because Windows resolves ::1 first and the fallback adds ~2s
+# per fresh connection (speak.py is a short-lived subprocess per Claude
+# turn so never benefits from connection reuse).
+_TTS_DEFAULTS = {
+    "cpu":    ("http://127.0.0.1:13305", "/api/v1/audio/speech"),
+    "kokoro": ("http://127.0.0.1:13306", "/api/v1/audio/speech"),
+    "f5":     ("http://127.0.0.1:13307", "/api/v1/audio/speech"),
+    "kobold": ("http://127.0.0.1:13308", "/v1/audio/speech"),
+}
+_VOICE_TTS = (os.environ.get("VOICE_TTS") or "cpu").lower()
+_default_url, _default_path = _TTS_DEFAULTS.get(_VOICE_TTS, _TTS_DEFAULTS["cpu"])
+TTS_URL = os.environ.get("TTS_URL", _default_url)
+TTS_SPEECH_PATH = os.environ.get("TTS_SPEECH_PATH", _default_path)
+SPEECH_ENDPOINT = os.environ.get("TTS_SPEECH_URL", f"{TTS_URL}{TTS_SPEECH_PATH}")
 KOKORO_MODEL = os.environ.get("KOKORO_MODEL", "kokoro-v1")
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
 MAX_CHARS = int(os.environ.get("SPEAK_MAX_CHARS", "1500"))

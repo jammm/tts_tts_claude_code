@@ -157,6 +157,27 @@ Render-Template `
         "__ROCM_BIN__"    = $RocmBin
     }
 
+# koboldcpp-rocm shim: only rendered if the HIP DLL was built. The
+# install continues either way — the user must run
+# tools\build_koboldcpp_hip.cmd before setting VOICE_TTS=kobold.
+$KoboldDir    = Join-Path $WorkspaceRoot "vendor\koboldcpp-rocm"
+$KoboldDll    = Join-Path $KoboldDir "koboldcpp_hipblas.dll"
+$KokoroGguf   = Join-Path $WorkspaceRoot "models\Kokoro_no_espeak_Q4.gguf"
+if ((Test-Path $KoboldDll) -and (Test-Path $KokoroGguf)) {
+    Render-Template `
+        (Join-Path $WorkspaceRoot "installers\run_kobold.ps1.tmpl") `
+        (Join-Path $ShimDir "run_kobold.ps1") `
+        @{
+            "__VENV_PYTHON__"  = $VenvPython
+            "__KOBOLD_DIR__"   = $KoboldDir
+            "__KOKORO_GGUF__"  = $KokoroGguf
+            "__ROCM_BIN__"     = $RocmBin
+        }
+    Write-Host "[install] kobold shim rendered (DLL=$KoboldDll)"
+} else {
+    Write-Host "[install] skipping kobold shim — build DLL via tools\build_koboldcpp_hip.cmd and place Kokoro_no_espeak_Q4.gguf in models\"
+}
+
 Write-Host "[install] shims: $ShimDir\run_lemonade.ps1, $ShimDir\run_ptt.ps1, $ShimDir\run_kokoro.ps1, $ShimDir\run_f5.ps1"
 
 # ---------------------------------------------------------------- settings.json

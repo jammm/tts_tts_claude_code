@@ -81,8 +81,10 @@ $lemPid = Start-Service -Name "lemonade" -ShimPath (Join-Path $Base "run_lemonad
 
 # 2. TTS. Default is "cpu" = Lemonade's built-in Kokoro on :13305 (no
 # extra process to start). Set VOICE_TTS=f5 for F5-TTS on GPU (:13307,
-# pure-eager PyTorch) or VOICE_TTS=kokoro for our ROCm Kokoro service
-# (:13306, torch.compile).
+# pure-eager PyTorch), VOICE_TTS=kokoro for our ROCm PyTorch Kokoro
+# service (:13306, torch.compile — experimental), or VOICE_TTS=kobold
+# for koboldcpp's HIP build running ttscpp Kokoro on CPU (:13308 —
+# fastest cold start, no python in the hot loop).
 $ttsBackend = if ($env:VOICE_TTS) { $env:VOICE_TTS.ToLower() } else { "cpu" }
 $ttsPid   = 0
 $ttsPort  = 13305
@@ -99,6 +101,18 @@ if ($ttsBackend -eq "kokoro") {
     [void](Wait-ForHealth "http://localhost:13307/api/v1/health" 120)
     $ttsPort  = 13307
     $ttsLabel = "f5 (TTS/GPU)"
+} elseif ($ttsBackend -eq "kobold") {
+    $koboldShim = Join-Path $Base "run_kobold.ps1"
+    if (-not (Test-Path $koboldShim)) {
+        throw "VOICE_TTS=kobold but run_kobold.ps1 missing. Build koboldcpp_hipblas.dll via tools\build_koboldcpp_hip.cmd then rerun installers\install_windows.ps1"
+    }
+    $ttsPid = Start-Service -Name "kobold" -ShimPath $koboldShim -ExistingPid (_get $existing "kobold")
+    Write-Host "[start] waiting for koboldcpp Kokoro load (up to 60s)..."
+    # Koboldcpp's root returns 200 with its Kobold UI once the backend
+    # loads; there's no dedicated /health endpoint, so we probe / instead.
+    [void](Wait-ForHealth "http://localhost:13308/" 60)
+    $ttsPort  = 13308
+    $ttsLabel = "kobold (TTS/HIP Kokoro)"
 }
 # "cpu" falls through: lemonade on :13305 already serves /audio/speech
 # via kokoro-v1, no extra service needed.
@@ -109,13 +123,18 @@ $pttPid = Start-Service -Name "ptt" -ShimPath (Join-Path $Base "run_ptt.ps1") -E
 $state = @{ lemonade = $lemPid; ptt = $pttPid; tts_backend = $ttsBackend; started_at = (Get-Date).ToString("o") }
 if ($ttsBackend -eq "kokoro") { $state.kokoro = $ttsPid }
 elseif ($ttsBackend -eq "f5") { $state.f5 = $ttsPid }
+elseif ($ttsBackend -eq "kobold") { $state.kobold = $ttsPid }
 $state | ConvertTo-Json | Set-Content -Path $PidFile -NoNewline
 
 Write-Host ""
 Write-Host "Services up. Health:"
 $endpoints = @(@{ name = "lemonade (STT)"; url = "http://localhost:13305/api/v1/health" })
-if ($ttsBackend -ne "cpu") {
+if ($ttsBackend -eq "kokoro" -or $ttsBackend -eq "f5") {
     $endpoints += @{ name = $ttsLabel; url = "http://localhost:$ttsPort/api/v1/health" }
+} elseif ($ttsBackend -eq "kobold") {
+    # Koboldcpp has no /api/v1/health — probe root. If we got here it
+    # answered 200 on / already during Wait-ForHealth above.
+    Write-Host "  tts backend: koboldcpp HIP Kokoro on :$ttsPort (OpenAI speech API at /v1/audio/speech)"
 } else {
     Write-Host "  tts backend: Lemonade CPU Kokoro (via :13305 /api/v1/audio/speech)"
 }

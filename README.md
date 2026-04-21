@@ -163,13 +163,28 @@ $env:VOICE_TTS = "f5"
 # Experimental: our torch.compile-based Kokoro on GPU
 $env:VOICE_TTS = "kokoro"
 .\installers\stop_services.ps1 && .\installers\start_services.ps1
+
+# koboldcpp HIP build running ttscpp Kokoro. Fastest cold-start path
+# (median ~1s, 3.2s for long paragraphs, no warm-up penalty). Requires
+# building koboldcpp_hipblas.dll first — see the koboldcpp section
+# below. Kokoro itself runs on CPU inside this build because the ttscpp
+# library doesn't yet have a GPU kokoro path upstream; the HIP build
+# still wins on cold start because there's no python / torch.compile in
+# the hot loop.
+$env:VOICE_TTS = "kobold"
+.\installers\stop_services.ps1 && .\installers\start_services.ps1
 ```
 
-`speak.py` picks the server based on `TTS_URL` env var (defaults to `http://127.0.0.1:13305`). If you flip `VOICE_TTS=f5` you also want `TTS_URL=http://127.0.0.1:13307` in the shell where you run `claude`:
+`speak.py` auto-picks the right `TTS_URL` / `TTS_SPEECH_PATH` based on `VOICE_TTS` now, so once services are up you can usually launch `claude` without touching any other env var. Explicit overrides are still honored for non-default ports:
 
 ```powershell
-$env:VOICE_TTS = "f5"; .\installers\stop_services.ps1; .\installers\start_services.ps1
-$env:TTS_URL = "http://127.0.0.1:13307"
+# Default mapping built into speak.py:
+#   cpu    -> http://127.0.0.1:13305/api/v1/audio/speech
+#   kokoro -> http://127.0.0.1:13306/api/v1/audio/speech
+#   f5     -> http://127.0.0.1:13307/api/v1/audio/speech
+#   kobold -> http://127.0.0.1:13308/v1/audio/speech    (note: OpenAI path)
+$env:VOICE_TTS = "f5"
+.\installers\stop_services.ps1; .\installers\start_services.ps1
 claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
 ```
 
@@ -297,6 +312,50 @@ After `start_services.ps1`:
 - **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`%VENV%\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for both C and CXX to match compiler families. Mixing with hipcc (GNU-driver) trips CMake's same-family check.
 - **ggml overlay** happens automatically on each `build_whisper_hip.cmd` run: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. No submodule files get committed; the overlay is a build-time step.
 - **`cudnn`/MIOpen stays on.** MIOpen is the accuracy-preserving path on ROCm; `torch.backends.cudnn.enabled = False` swaps in an `aten::lstm` fallback that's numerically different and produces worse-sounding audio on this stack.
+
+### Building koboldcpp with HIPBLAS (optional, for `VOICE_TTS=kobold`)
+
+`deps/koboldcpp` is pinned to upstream `LostRuins/koboldcpp`. We build a custom `koboldcpp_hipblas.dll` for gfx1201 and stage it at `vendor/koboldcpp-rocm/` alongside the python launcher. This is NOT required for the default flow — everything else ships without touching koboldcpp.
+
+```powershell
+.\tools\build_koboldcpp_hip.cmd          # full build (10-20 minutes)
+.\tools\build_koboldcpp_hip.cmd clean    # force reconfigure + rebuild
+
+# After the build, download the Kokoro GGUF model:
+$dest = "models\Kokoro_no_espeak_Q4.gguf"
+curl.exe -L -o $dest `
+    "https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf"
+
+# Re-run the installer so it renders run_kobold.ps1:
+.\installers\install_windows.ps1
+
+# Then flip VOICE_TTS and restart services as usual.
+$env:VOICE_TTS = "kobold"
+.\installers\stop_services.ps1; .\installers\start_services.ps1
+```
+
+What's patched upstream (`deps/koboldcpp/CMakeLists.txt`, in our fork):
+
+- Added `target_include_directories` to the four `ggml-*rocm` HIP targets — upstream only set them on the main `ggml` target, which broke `amdclang-cl` with "ggml.h: file not found" on Windows.
+- Switched the rocm targets from `SHARED` to `OBJECT` libraries absorbed into the parent `ggml`/`ggml_v2`/`ggml_v3` targets. Upstream's SHARED layout creates circular symbol refs (`ggml_v2.c` calls `ggml_v2_cuda_mul_mat` in the .cu sibling and vice versa) that only resolve on Linux static linking. Merging them drops the separate `ggml-v2-legacy-rocm` target (v2 and v2-legacy .cu files coexist in `ggml-v2-rocm` now).
+- Dropped `BUILD_SHARED_LIBS=ON` in the build script. With shared libs every intermediate `common2.dll`, `gpttype_adapter.dll` etc. has to resolve all its symbols at link time, but upstream relies on `gpttype_adapter.cpp` doing `#include "src/llama.cpp"` so `llama_*` symbols live only there. Static intermediates defer resolution until the final `koboldcpp_hipblas.dll` link — which works.
+- `clang++.exe` (GNU driver) instead of `amdclang-cl.exe` (MSVC driver) as the CXX compiler. The clang-cl driver names HIP offload-bundler intermediates `*.exe` (MSVC conventions) and then the bundler can't find them; the GNU driver produces `*.o` like the HIP toolchain expects.
+- Added every `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*.cu` to `GGML_SOURCES_CUDA`. Upstream only listed a subset explicitly, which worked because their CUDA CMake glob caught the rest; on our HIP-only path the linker failed with "undefined symbol: `ggml_cuda_flash_attn_ext_vec_case<64,1,1>`" etc.
+
+Note: `VOICE_TTS=kobold` runs Kokoro on CPU even though the DLL is HIP-enabled. ttscpp (koboldcpp's TTS engine) doesn't have a GPU Kokoro path upstream — see the comment in `deps/koboldcpp/otherarch/ttscpp/src/ttscpp.cpp::kokoro_from_file`. A draft GPU patch lives in git history; wiring `model->backend = ggml_backend_cuda_init(0)` + scheduler integration crashes mid-generation because several Kokoro ops (LSTM decomposition + iSTFT window setup) don't have stable HIP code paths in ggml's backend yet. The CPU path is still fast: ~1 s median, no warm-up penalty.
+
+### Benchmarks (gfx1201 / RX 9070 XT)
+
+| Prompt (chars)            | F5-TTS (GPU)    | Kokoro-PyTorch (GPU, eager) | Kobold-HIP Kokoro (CPU) |
+|---------------------------|-----------------|-----------------------------|-------------------------|
+| short (12)                | ~0.4 s          | ~1.5 s warm / ~15 s cold    | **0.59 s**              |
+| medium (52)               | ~0.6 s          | ~0.8 s warm                 | **0.50 s**              |
+| long (127)                | ~1.3 s          | ~1.5 s warm                 | **0.93 s**              |
+| poem (402)                | ~2.5 s          | **14.6 s cold** / ~3.2 s    | **3.16 s**              |
+| total 6 prompts (warm)    | ~8 s            | ~62 s (includes warmup)     | **7.48 s**              |
+| median                    | ~0.9 s          | ~1.5 s                      | **0.96 s**              |
+
+The Kokoro-PyTorch numbers include `torch._dynamo` shape-warmup that has to run once per unseen input length. Kobold-HIP has no such phase.
 
 ## Out of scope (v1)
 

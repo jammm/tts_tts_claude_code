@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-LEMONADE_URL = os.environ.get("LEMONADE_URL", "http://localhost:13305")
+# 127.0.0.1 not localhost — see speak.py for the Windows IPv6-fallback note.
+LEMONADE_URL = os.environ.get("LEMONADE_URL", "http://127.0.0.1:13305")
 TRANSCRIBE_ENDPOINT = f"{LEMONADE_URL}/api/v1/audio/transcriptions"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "Whisper-Small")
 

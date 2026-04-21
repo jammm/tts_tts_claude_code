@@ -34,6 +34,7 @@ if (Test-Path $PidFile) {
 }
 if ($recorded) {
     Stop-Tree -RootPid ([int]$recorded.lemonade) -Label "lemonade"
+    Stop-Tree -RootPid ([int]$recorded.kokoro)   -Label "kokoro"
     Stop-Tree -RootPid ([int]$recorded.ptt)      -Label "ptt"
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }
@@ -44,10 +45,10 @@ Get-Process lemond -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[stop] lemond pid=$($_.Id) killed (orphan)"
 }
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue `
-    | Where-Object { $_.CommandLine -match "ptt_daemon|ptt\.ptt" } `
+    | Where-Object { $_.CommandLine -match "ptt_daemon|ptt\.ptt|kokoro_server" } `
     | ForEach-Object {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        Write-Host "[stop] ptt_daemon pid=$($_.ProcessId) killed (orphan)"
+        Write-Host "[stop] daemon pid=$($_.ProcessId) killed (orphan)"
     }
 
 Write-Host "[stop] done"

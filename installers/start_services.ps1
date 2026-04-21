@@ -64,30 +64,44 @@ function _get($obj, $key) {
     if ($m) { return [int]$m.Value } else { return 0 }
 }
 
-$lemPid = Start-Service -Name "lemonade" -ShimPath (Join-Path $Base "run_lemonade.ps1") -ExistingPid (_get $existing "lemonade")
-
-# Give lemond a moment to bind before firing the PTT daemon that talks to it.
-$deadline = (Get-Date).AddSeconds(8)
-while ((Get-Date) -lt $deadline) {
-    try {
-        $null = Invoke-WebRequest -Uri "http://localhost:13305/api/v1/health" -TimeoutSec 1 -UseBasicParsing
-        break
-    } catch {
-        Start-Sleep -Milliseconds 200
+function Wait-ForHealth([string]$url, [int]$timeoutSec) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $null = Invoke-WebRequest -Uri $url -TimeoutSec 1 -UseBasicParsing
+            return $true
+        } catch { Start-Sleep -Milliseconds 500 }
     }
+    return $false
 }
 
+# 1. Lemonade (STT)
+$lemPid = Start-Service -Name "lemonade" -ShimPath (Join-Path $Base "run_lemonade.ps1") -ExistingPid (_get $existing "lemonade")
+[void](Wait-ForHealth "http://localhost:13305/api/v1/health" 8)
+
+# 2. Kokoro (TTS on GPU) — model load + JIT warmup takes ~30s on cold start.
+$kokoroPid = Start-Service -Name "kokoro" -ShimPath (Join-Path $Base "run_kokoro.ps1") -ExistingPid (_get $existing "kokoro")
+Write-Host "[start] waiting for kokoro model load + JIT warmup (up to 90s)..."
+[void](Wait-ForHealth "http://localhost:13306/api/v1/health" 90)
+
+# 3. PTT daemon (F9 + wake word)
 $pttPid = Start-Service -Name "ptt" -ShimPath (Join-Path $Base "run_ptt.ps1") -ExistingPid (_get $existing "ptt")
 
-@{ lemonade = $lemPid; ptt = $pttPid; started_at = (Get-Date).ToString("o") } | ConvertTo-Json | Set-Content -Path $PidFile -NoNewline
+@{ lemonade = $lemPid; kokoro = $kokoroPid; ptt = $pttPid; started_at = (Get-Date).ToString("o") } `
+    | ConvertTo-Json | Set-Content -Path $PidFile -NoNewline
 
 Write-Host ""
 Write-Host "Services up. Health:"
-try {
-    $h = Invoke-RestMethod -Uri "http://localhost:13305/api/v1/health" -TimeoutSec 2 -UseBasicParsing
-    $h | ConvertTo-Json -Compress | Write-Host
-} catch {
-    Write-Warning "health probe failed: $_"
+foreach ($endpoint in @(
+    @{ name = "lemonade (STT)"; url = "http://localhost:13305/api/v1/health" },
+    @{ name = "kokoro (TTS/GPU)"; url = "http://localhost:13306/api/v1/health" }
+)) {
+    try {
+        $h = Invoke-RestMethod -Uri $endpoint.url -TimeoutSec 2 -UseBasicParsing
+        Write-Host ("  " + $endpoint.name + ": " + ($h | ConvertTo-Json -Compress))
+    } catch {
+        Write-Warning ("  " + $endpoint.name + " probe failed: " + $_)
+    }
 }
 Write-Host ""
 Write-Host "Stop with: .\installers\stop_services.ps1"

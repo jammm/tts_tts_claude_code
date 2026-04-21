@@ -135,6 +135,15 @@ Render-Template `
         "__DAEMON_DIR__"  = $DaemonDest
     }
 
+Render-Template `
+    (Join-Path $WorkspaceRoot "installers\run_kokoro.ps1.tmpl") `
+    (Join-Path $ShimDir "run_kokoro.ps1") `
+    @{
+        "__VENV_PYTHON__" = $VenvPython
+        "__DAEMON_DIR__"  = $DaemonDest
+        "__ROCM_BIN__"    = $RocmBin
+    }
+
 Write-Host "[install] shims: $ShimDir\run_lemonade.ps1, $ShimDir\run_ptt.ps1"
 
 # ---------------------------------------------------------------- settings.json
@@ -229,7 +238,11 @@ if ($RegisterScheduledTasks) {
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -StartWhenAvailable
 
-    foreach ($name in @("VoiceLemonade", "VoicePTT")) {
+    $KokoroAction = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ShimDir\run_kokoro.ps1`""
+
+    foreach ($name in @("VoiceLemonade", "VoicePTT", "VoiceKokoro")) {
         if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
             Unregister-ScheduledTask -TaskName $name -Confirm:$false
         }
@@ -240,7 +253,14 @@ if ($RegisterScheduledTasks) {
         -Action $LemonadeAction `
         -Trigger $Trigger `
         -Settings $Settings `
-        -Description "Local Lemonade server (TTS/STT) for voice plugin" | Out-Null
+        -Description "Local Lemonade server (STT whispercpp on ROCm)" | Out-Null
+
+    Register-ScheduledTask `
+        -TaskName "VoiceKokoro" `
+        -Action $KokoroAction `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Description "Kokoro TTS server on ROCm (GPU)" | Out-Null
 
     Register-ScheduledTask `
         -TaskName "VoicePTT" `

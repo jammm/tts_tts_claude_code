@@ -28,8 +28,14 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 
-LEMONADE_URL = os.environ.get("LEMONADE_URL", "http://localhost:13305")
-SPEECH_ENDPOINT = f"{LEMONADE_URL}/api/v1/audio/speech"
+# By default we hit the ROCm Kokoro service (GPU) on :13306. Override to
+# http://127.0.0.1:13305 to fall back to Lemonade's CPU Kokoro.
+# Use 127.0.0.1 rather than localhost: on Windows, name resolution tries
+# IPv6 (::1) first and the failed-then-fallback path adds ~2s per fresh
+# connection. speak.py runs as a short-lived subprocess per Claude turn so
+# it never benefits from connection reuse.
+TTS_URL = os.environ.get("TTS_URL", "http://127.0.0.1:13306")
+SPEECH_ENDPOINT = f"{TTS_URL}/api/v1/audio/speech"
 KOKORO_MODEL = os.environ.get("KOKORO_MODEL", "kokoro-v1")
 KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
 MAX_CHARS = int(os.environ.get("SPEAK_MAX_CHARS", "1500"))

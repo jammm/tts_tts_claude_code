@@ -54,8 +54,10 @@ PTT_AUTO_SUBMIT = os.environ.get("PTT_AUTO_SUBMIT", "1").lower() not in (
 # model.
 WAKE_PHRASE = os.environ.get(
     "WAKE_PHRASE",
-    # "hey halo" and common Whisper mishearings of "halo".
-    r"^\s*(?:hey[,\s]+|ok[,\s]+|okay[,\s]+)?"
+    # "hey halo" / "hi halo" + common Whisper mishearings of each. The
+    # prefix is REQUIRED so bare "halo ..." (a sentence someone happens
+    # to start with the word halo) doesn't trigger us.
+    r"^\s*(?:hey|hi|high|he)[,\s]+"
     r"(?:halo|hello|hallo|hailo|halow|haloo|hollow)"
     r"[\s,.:;!?-]*",
 )

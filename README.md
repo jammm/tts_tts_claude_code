@@ -4,7 +4,7 @@ Local STT, wake word, and TTS for [Claude Code](https://docs.claude.com/en/docs/
 
 - **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp. On a 9070 XT (gfx1201) with Whisper-Large-v3-Turbo, transcribes 37.8 s of speech in ~460 ms steady-state — 80× realtime. Requires a patched Lemonade (our `jam/windows-rocm-whisper` submodule branch) because upstream Lemonade only wires CPU / NPU / Vulkan for whispercpp.
 - **Wake word ("hey halo" by default)** — no custom keyword-spotter. Every energy-gated speech burst gets transcribed by Whisper; the transcript is typed only if it starts with the configured wake phrase. Changing the wake phrase is a single env var.
-- **TTS via Lemonade's bundled CPU Kokoro** by default. A pure-eager-PyTorch GPU backend ([F5-TTS on ROCm](#optional-f5-tts-on-gpu)) is available opt-in via `VOICE_TTS=f5`.
+- **TTS on the GPU** via our patched koboldcpp HIP build running Kokoro through ttscpp. Pinned to `jammm/koboldcpp jam/gfx1201-hip` with four upstream bug-fixes (128-byte tensor alignment, `reciprocal()` host-pointer hack, direct-`->data` writes in `set_inputs`, shared HIP stream) plus a fused `snake_1d` megakernel and CUDA implementations for the kcpp ttscpp dirtypatch ops. Opt-out to CPU via `VOICE_TTS=cpu` or to F5-TTS via `VOICE_TTS=f5` — see [Switching TTS backends](#switching-tts-backends).
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
 - **Focus gated to Claude Code** — F9 and wake only fire when the foreground window hosts a `claude.exe` process (or a terminal that has `claude` running alongside). Transcriptions never accidentally land in the wrong app.
 - **Auto-submit** — the daemon presses Enter after typing the transcription so Claude starts processing the moment you stop talking. Set `PTT_AUTO_SUBMIT=0` to review before sending.
@@ -15,7 +15,7 @@ Based on [`PLAN.md`](PLAN.md), with Windows/ROCm-specific adjustments documented
 
 If you're another Claude agent picking up this codebase, read this whole section before touching anything — the short version of how the pieces fit together:
 
-- **Three things run on localhost**: `lemond.exe` (port 13305, STT+CPU TTS), optionally the F5-TTS service (port 13307, GPU TTS), and the `ptt_daemon` Python process (no port; F9 + wake word + typing). Lemonade is always required. F5 is opt-in. The PTT daemon is always required.
+- **Three things run on localhost**: `lemond.exe` (port 13305, STT + built-in CPU Kokoro fallback), `koboldcpp_hipblas.dll`-backed python process (port 13308, default GPU TTS) and the `ptt_daemon` Python process (no port; F9 + wake word + typing). Lemonade is always required. The kobold TTS service is default; F5 / kokoro / cpu-only are opt-in via `VOICE_TTS`. The PTT daemon is always required.
 - **Code lives in four places:**
   - `ptt/` — the PTT daemon (wake detection, recording, transcription, typing) and the optional `kokoro_server.py` / `f5_tts_server.py` GPU TTS services.
   - `claude-plugin-voice/` — the Claude Code plugin (Stop hook that speaks replies, `/voice:speak` slash command).
@@ -83,13 +83,13 @@ vendor/whisper-cpp-rocm/          whisper-server.exe + ggml-hip.dll + ROCm DLLs
 | `kokoro_server` | 13306 | `/api/v1/audio/speech` (experimental)              | hexgrad/Kokoro-82M with `torch.compile(backend=eager)` |
 | `ptt_daemon`  | —     | F9 hotkey + Whisper-wake + recorder + typer         | pynput + sounddevice + HTTP to lemond                   |
 
-Default runtime is just `lemond` + `ptt_daemon`. F5 and Kokoro-GPU are opt-in via `VOICE_TTS=f5` or `VOICE_TTS=kokoro`.
+Default runtime is `lemond` (STT on ROCm GPU + fallback CPU Kokoro) + `koboldcpp_hipblas` (GPU Kokoro) + `ptt_daemon`. F5 and the experimental PyTorch Kokoro GPU service are opt-in via `VOICE_TTS=f5` or `VOICE_TTS=kokoro`.
 
 ## Prerequisites
 
 - Windows 11, AMD Radeon RX 9000-series or Ryzen AI Max+ / Strix Halo (gfx120X / gfx1151)
 - Python 3.12 on `PATH` as `py -3.12`
-- Visual Studio 2022 Community (Desktop C++ workload) — needed to build `lemond.exe` and `whisper-server.exe`
+- Visual Studio 2022 Community (Desktop C++ workload) — needed to build `lemond.exe`, `whisper-server.exe`, and `koboldcpp_hipblas.dll`
 - CMake 3.28+
 - Git
 - Claude Code CLI (`claude`)
@@ -113,25 +113,37 @@ pip install -r requirements.txt
 pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
 rocm-sdk init        # extracts the ROCm runtime into the venv (~1.3 GB)
 
-# 4. Build the two C++ binaries (~3-4 min total on a warm box)
-.\tools\build_lemonade_cpp.cmd
-.\tools\build_whisper_hip.cmd
+# 4. Build the three C++ binaries (~15-20 min total on a warm box).
+# The default TTS backend is GPU Kokoro via koboldcpp, so all three
+# are required for a first-time install.
+.\tools\build_lemonade_cpp.cmd        # ~3 min    -> vendor\lemonade-cpp\lemond.exe
+.\tools\build_whisper_hip.cmd         # ~2 min    -> vendor\whisper-cpp-rocm\whisper-server.exe (ROCm GPU STT)
+.\tools\build_koboldcpp_hip.cmd       # ~10-15 min -> vendor\koboldcpp-rocm\koboldcpp_hipblas.dll (HIP GPU TTS)
+# (Override gfx target with $env:GFX_TARGET="gfx1150" for Strix Halo
+# before running the HIP builds — see Deploying on Strix Halo below.)
 
-# 5. Pull the Whisper STT model into Lemonade's cache
+# 5. Download the Kokoro GGUF weights koboldcpp will serve
+New-Item -ItemType Directory -Force models | Out-Null
+curl.exe -L -o models\Kokoro_no_espeak_Q4.gguf `
+  https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf
+
+# 6. Pull the Whisper STT model into Lemonade's cache
 .\vendor\lemonade-cpp\lemond.exe          # leave running in this shell
 .\vendor\lemonade-cpp\lemonade.exe pull Whisper-Large-v3-Turbo
 # (Whisper-Small works too if you want ~3x faster but noticeably less
 # accurate STT. Override with WHISPER_MODEL env var.)
 # Ctrl-C the lemond above — start_services.ps1 launches it properly later.
 
-# 6. Deploy plugin + daemon + settings.json hook
+# 7. Deploy plugin + daemon + settings.json hook
 .\installers\install_windows.ps1
 
-# 7. Launch services
+# 8. Launch services
 .\installers\start_services.ps1
 ```
 
-After step 7 you have `lemond` (STT+TTS) + `ptt_daemon` running. F9 push-to-talk and "hey halo" wake-word are both armed.
+After step 8 you have `lemond` (STT on ROCm GPU) + `koboldcpp_hipblas` (TTS on HIP GPU) + `ptt_daemon` running. F9 push-to-talk and "hey halo" wake-word are both armed.
+
+If you're resurrecting an existing install and just want to move from the old CPU-TTS default to the new GPU-TTS default: run steps 4b (`build_koboldcpp_hip.cmd`), 5 (download GGUF), 7 (`install_windows.ps1` to re-render the shim), then `.\installers\stop_services.ps1; .\installers\start_services.ps1`.
 
 ```powershell
 claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
@@ -189,40 +201,51 @@ If Strix Halo doesn't even need ROCm whisper (the NPU is fast enough), you can s
 ### Switching TTS backends
 
 ```powershell
-# Default: Lemonade CPU Kokoro (already running as part of lemond)
-.\installers\stop_services.ps1 && .\installers\start_services.ps1
+# Default when vendor\koboldcpp-rocm\koboldcpp_hipblas.dll is built:
+# koboldcpp HIP Kokoro on :13308 (runs Kokoro on the GPU — see
+# "Kokoro on the GPU (HIP)" below for what that entails).
+.\installers\stop_services.ps1; .\installers\start_services.ps1
 
-# F5-TTS on GPU (pure eager, consistent 300-900 ms/sentence)
-$env:VOICE_TTS = "f5"
-.\installers\stop_services.ps1 && .\installers\start_services.ps1
+# CPU opt-out (useful when the GPU is busy training or you want to
+# A/B latency on the same DLL):
+$env:VOICE_TTS = "cpu"      # Lemonade's built-in Kokoro on :13305
+.\installers\stop_services.ps1; .\installers\start_services.ps1
 
-# Experimental: our torch.compile-based Kokoro on GPU
-$env:VOICE_TTS = "kokoro"
-.\installers\stop_services.ps1 && .\installers\start_services.ps1
-
-# koboldcpp HIP build running ttscpp Kokoro. Fastest cold-start path
-# (median ~1s, 3.2s for long paragraphs, no warm-up penalty). Requires
-# building koboldcpp_hipblas.dll first — see the koboldcpp section
-# below. Kokoro itself runs on CPU inside this build because the ttscpp
-# library doesn't yet have a GPU kokoro path upstream; the HIP build
-# still wins on cold start because there's no python / torch.compile in
-# the hot loop.
-$env:VOICE_TTS = "kobold"
-.\installers\stop_services.ps1 && .\installers\start_services.ps1
-```
-
-`speak.py` auto-picks the right `TTS_URL` / `TTS_SPEECH_PATH` based on `VOICE_TTS` now, so once services are up you can usually launch `claude` without touching any other env var. Explicit overrides are still honored for non-default ports:
-
-```powershell
-# Default mapping built into speak.py:
-#   cpu    -> http://127.0.0.1:13305/api/v1/audio/speech
-#   kokoro -> http://127.0.0.1:13306/api/v1/audio/speech
-#   f5     -> http://127.0.0.1:13307/api/v1/audio/speech
-#   kobold -> http://127.0.0.1:13308/v1/audio/speech    (note: OpenAI path)
+# F5-TTS on GPU (pure-eager DiT, 300-900 ms/sentence, needs
+# tools\build_koboldcpp_hip.cmd to have been run since F5 uses the
+# same TheRock ROCm wheels):
 $env:VOICE_TTS = "f5"
 .\installers\stop_services.ps1; .\installers\start_services.ps1
-claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
+
+# Experimental: our torch.compile-based Kokoro on GPU (has
+# recompile cliffs; mostly kept for reference):
+$env:VOICE_TTS = "kokoro"
+.\installers\stop_services.ps1; .\installers\start_services.ps1
+
+# Inside the "kobold" backend you can force ttscpp to CPU (A/B
+# without rebuilding the DLL — useful because the services.json
+# still records tts_backend=kobold so speak.py keeps routing to
+# :13308 regardless):
+$env:VOICE_TTS_KOBOLD_CPU = "1"
+.\installers\stop_services.ps1; .\installers\start_services.ps1
 ```
+
+`speak.py` auto-picks the right `TTS_URL` / `TTS_SPEECH_PATH` in this order:
+
+1. `TTS_SPEECH_URL` env (full URL override)
+2. `TTS_URL` + `TTS_SPEECH_PATH` env
+3. `VOICE_TTS` env
+4. `%LOCALAPPDATA%\voice-plugin\services.json` `tts_backend` — what `start_services.ps1` actually launched (this matters because Claude Code's Stop hook runs as a subprocess of `claude`, NOT of the shell that started services, so env vars from that shell don't propagate — the services.json hop is how the hook learns the current backend)
+5. `cpu` fallback
+
+Backend → port mapping used internally:
+
+| VOICE_TTS | Server                  | URL                                            |
+|-----------|-------------------------|------------------------------------------------|
+| `kobold`  | koboldcpp HIP Kokoro    | `http://127.0.0.1:13308/v1/audio/speech`       |
+| `cpu`     | Lemonade CPU Kokoro     | `http://127.0.0.1:13305/api/v1/audio/speech`   |
+| `f5`      | F5-TTS on GPU           | `http://127.0.0.1:13307/api/v1/audio/speech`   |
+| `kokoro`  | ROCm PyTorch Kokoro     | `http://127.0.0.1:13306/api/v1/audio/speech`   |
 
 ### Running the daemon interactively
 
@@ -333,8 +356,8 @@ After `start_services.ps1`:
 ## Architecture decisions / trade-offs
 
 - **Whisper-based wake word instead of a keyword-spotter.** The original design used openWakeWord ("hey jarvis"), but that limited us to its 5 pre-trained phrases unless we trained a custom model. Reusing the Whisper STT we already run — transcribe each energy-gated speech burst, regex-match the transcript — lets us change the wake phrase to anything with one env var. Cost: one Whisper call per utterance vs. openWakeWord's per-frame inference, but Whisper only runs when someone's actually speaking, so amortized load is modest.
-- **Lemonade CPU Kokoro as default TTS.** It's already running for STT, so there's zero additional service to start. Latency is a few hundred ms per sentence on a modern CPU, which is fine for Claude Code's typical reply length. F5-TTS on GPU is faster for long outputs and available opt-in.
-- **F5-TTS over our custom `kokoro_server` as the GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py`) for experimentation but isn't default.
+- **koboldcpp HIP Kokoro as default TTS.** Runs Kokoro on the GPU through the ttscpp backend in our `jammm/koboldcpp jam/gfx1201-hip` fork (four upstream bugs patched so Kokoro even starts a kernel without crashing, plus a fused `snake_1d` megakernel and CUDA kernels for the kcpp ttscpp dirtypatch ops — see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip)). No python in the hot loop, no `torch.compile` recompile cliffs. Latency varies with GPU — on gfx1201 / RX 9070 XT it's ~0.4 s for short prompts and ~8 s for a 400-char paragraph; on Strix Halo (gfx1150) once the NPU path matures it'll be the same or faster. Fallbacks: `VOICE_TTS=cpu` for Lemonade's built-in Kokoro (always available, lemond ships it), `VOICE_TTS=f5` for F5-TTS's flow-matching DiT on GPU.
+- **F5-TTS over our custom `kokoro_server` as the PyTorch GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py`) for experimentation but isn't default and has torch-compile issues.
 - **Focus gate.** F9 and wake only fire when a `claude.exe` process lives under the foreground window (or when a known terminal-hosting process like Windows Terminal is focused and `claude` is running anywhere on the system). The recorder re-checks just before typing to handle focus drift during Whisper's round-trip.
 - **Stop hook lives in `~/.claude/settings.json`, not just `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks. The installer merges the Stop hook inline so it fires in both `--plugin-dir` and `/plugin install` modes.
 - **Venv at workspace root (`.\.venv`).** The installer bakes the venv Python path into the shims, so the daemon always uses the right interpreter.
@@ -349,28 +372,28 @@ After `start_services.ps1`:
 - **ggml overlay** happens automatically on each `build_whisper_hip.cmd` run: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. No submodule files get committed; the overlay is a build-time step.
 - **`cudnn`/MIOpen stays on.** MIOpen is the accuracy-preserving path on ROCm; `torch.backends.cudnn.enabled = False` swaps in an `aten::lstm` fallback that's numerically different and produces worse-sounding audio on this stack.
 
-### Building koboldcpp with HIPBLAS (optional, for `VOICE_TTS=kobold`)
+### Building koboldcpp with HIPBLAS (required — default TTS backend)
 
-`deps/koboldcpp` is pinned to upstream `LostRuins/koboldcpp`. We build a custom `koboldcpp_hipblas.dll` for gfx1201 and stage it at `vendor/koboldcpp-rocm/` alongside the python launcher. This is NOT required for the default flow — everything else ships without touching koboldcpp.
+`deps/koboldcpp` is pinned to `jammm/koboldcpp jam/gfx1201-hip`. This is our fork of `LostRuins/koboldcpp` with the HIPBLAS build working on Windows + the Kokoro-on-GPU patches (see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip) below for the bug-fix rundown and the fused-op work). We build `koboldcpp_hipblas.dll` for `gfx1201` by default (override with `$env:GFX_TARGET` for other AMD GPUs — `gfx1150` for Strix Halo, `gfx1150;gfx1201` for a fat binary) and stage it at `vendor/koboldcpp-rocm/` alongside `launch_kobold_rocm.py` and koboldcpp's python launcher.
 
 ```powershell
-.\tools\build_koboldcpp_hip.cmd          # full build (10-20 minutes)
+.\tools\build_koboldcpp_hip.cmd          # full build (10-15 minutes)
 .\tools\build_koboldcpp_hip.cmd clean    # force reconfigure + rebuild
 
-# After the build, download the Kokoro GGUF model:
-$dest = "models\Kokoro_no_espeak_Q4.gguf"
-curl.exe -L -o $dest `
-    "https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf"
+# Download the Kokoro GGUF weights (188 MB, Q4-quantised; Q5 / Q8 / F16
+# variants at https://huggingface.co/mmwillet2/Kokoro_GGUF/tree/main)
+New-Item -ItemType Directory -Force models | Out-Null
+curl.exe -L -o models\Kokoro_no_espeak_Q4.gguf `
+    https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf
 
 # Re-run the installer so it renders run_kobold.ps1:
 .\installers\install_windows.ps1
 
-# Then flip VOICE_TTS and restart services as usual.
-$env:VOICE_TTS = "kobold"
+# Restart services — kobold is the default now, no VOICE_TTS needed:
 .\installers\stop_services.ps1; .\installers\start_services.ps1
 ```
 
-What's patched upstream (`deps/koboldcpp/CMakeLists.txt`, in our fork):
+What's patched in `CMakeLists.txt` (in our fork):
 
 - Added `target_include_directories` to the four `ggml-*rocm` HIP targets — upstream only set them on the main `ggml` target, which broke `amdclang-cl` with "ggml.h: file not found" on Windows.
 - Switched the rocm targets from `SHARED` to `OBJECT` libraries absorbed into the parent `ggml`/`ggml_v2`/`ggml_v3` targets. Upstream's SHARED layout creates circular symbol refs (`ggml_v2.c` calls `ggml_v2_cuda_mul_mat` in the .cu sibling and vice versa) that only resolve on Linux static linking. Merging them drops the separate `ggml-v2-legacy-rocm` target (v2 and v2-legacy .cu files coexist in `ggml-v2-rocm` now).
@@ -378,22 +401,48 @@ What's patched upstream (`deps/koboldcpp/CMakeLists.txt`, in our fork):
 - `clang++.exe` (GNU driver) instead of `amdclang-cl.exe` (MSVC driver) as the CXX compiler. The clang-cl driver names HIP offload-bundler intermediates `*.exe` (MSVC conventions) and then the bundler can't find them; the GNU driver produces `*.o` like the HIP toolchain expects.
 - Added every `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*.cu` to `GGML_SOURCES_CUDA`. Upstream only listed a subset explicitly, which worked because their CUDA CMake glob caught the rest; on our HIP-only path the linker failed with "undefined symbol: `ggml_cuda_flash_attn_ext_vec_case<64,1,1>`" etc.
 
-Note: `VOICE_TTS=kobold` runs Kokoro on **CPU** even though the DLL is HIP-enabled. ttscpp (koboldcpp's TTS engine) doesn't have a GPU Kokoro path upstream — see the comment in `deps/koboldcpp/otherarch/ttscpp/src/ttscpp.cpp::kokoro_from_file`. We tried wiring one (commits available on `jam/gfx1201-hip` reachable via reflog: `8fac50bf7` "Run Kokoro TTS on GPU (HIP) for gfx1201" + `e97ae3f80` "Fused snake_1d megakernel + CUDA kernels for ttscpp dirtypatch ops"); it works correctly but ends up slower than the ggml CPU backend on this gfx1201 / TheRock build because (a) Kokoro is 82 M params with thousands of small ops where per-op kernel-launch latency dominates and (b) TheRock's rocBLAS for gfx1201 ships an incomplete Tensile kernel set so every F32 matmul logs `Cannot find the function: Cijk_Alik_Bljk_S_…` and falls back to a slow generic implementation. Revisit when either bottleneck moves.
+### Kokoro on the GPU (HIP)
+
+`VOICE_TTS=kobold` is the default. Kokoro runs on the GPU through ttscpp in our submodule (not upstream — ttscpp in `LostRuins/koboldcpp` is hardcoded `cpu_only=true` for all its TTS architectures, and `koboldcpp.py`'s `--ttsgpu` flag's tooltip even calls out "OuteTTS / Q3TTS only"). Getting Kokoro itself onto HIP took four upstream bugs and two optimisations:
+
+**Bugs that had to be fixed before a single kernel would launch:**
+
+1. **Tensor alignment** in `tts_model::set_tensor` / `kokoro_model::post_load_assign`. Kokoro's loader places weights with manual offset arithmetic (`tensor->data = base + offset; offset += ggml_nbytes(tensor)`) — no padding. The CUDA/HIP buffer requires 128-byte alignment per tensor, so e.g. `noise_blocks.0.resblock.0.alpha1` ended up at a device pointer ending in `0x1E` and HIP rejected the very first kernel that touched it (`MUL failed`, `ROCm error: unspecified launch failure`). Fix: round `offset` up to `ggml_backend_buft_get_alignment(buffer)` before each placement, over-allocate the buffer by `n_tensors * (alignment - 1)` so the rounding can never overflow.
+2. **`reciprocal()` host-pointer trick** in `ttsutil.cpp`. Upstream set `tensor->data = &one` (a host-side `static constexpr float`) with stride 0 as a clever "ones" broadcast. Works on CPU; crashes immediately when a GPU kernel dereferences the host pointer. Rewrote as `ggml_div(x, ggml_mul(x, x))` — mathematically `1/x` for non-zero x, uses only standard ops the scheduler can place on either backend.
+3. **Direct `((T*)tensor->data)[i] = …` writes** in `set_inputs()` for both `kokoro_runner` and `kokoro_duration_runner` (positions, attn_mask, uv_noise_data, duration_mask). On GPU those are device pointers. Rewrote to build CPU staging vectors + upload via `ggml_backend_tensor_set`. Same dance for `compute_window_squared_sum`, which dereferenced `model->decoder->generator->window->data` as CPU memory — window is now cached on CPU in `model->window_cpu_cache` during `post_load_assign`.
+4. **Three independent HIP streams** because `kokoro_model`, `kokoro_duration_context`, and `kokoro_context` each called `ggml_backend_cuda_init(0)` separately. Their interleaving made the first `MUL` kernel error out on gfx1201. The fork keeps one shared backend instance owned by `kokoro_model` and borrows it (with `owned_backend = false`) for both kctxes so the destructor doesn't double-free.
+
+**Optimisations on top of that:**
+
+1. **Fused `snake_1d` megakernel** as a new `GGML_OP_SNAKE_1D` op (`ggml_snake_1d(a, alpha)`). Snake activation is `a + sin²(a*α) / α`, which `ttsutil.cpp::snake_1d` previously expanded to a 7-op subgraph (mul, sin, sqr, mul, div, mul, add). Kokoro calls snake_1d 50+ times per inference (every AdaIN res block + noise res block), so that was 350 hipLaunchKernel + 300 intermediate allocs + 300 sync points. Now one fused kernel in `ggml-cuda/snake.cu` with a matching CPU impl in `ggml-cpu.c`.
+2. **CUDA kernels for the kcpp ttscpp dirtypatch ops** in `ggml-cuda/ttscpp_ops.cu`: `GGML_OP_RECIPROCAL`, `GGML_OP_TTSROUND`, `GGML_OP_MOD`, `GGML_OP_CUMSUM_TTS`. Upstream had CPU-only impls, so each call to one of these inside an otherwise-GPU graph triggered a GPU→host→GPU bounce. Kokoro fires `ggml_mod` + `ggml_cumsum_tts` on every generator block.
+
+**Runtime knobs the shim sets:**
+
+- `GGML_CUDA_FORCE_MMQ=1` + `--usecuda normal 0 mmq`. TheRock's rocBLAS for gfx1201 ships with an incomplete Tensile kernel set — without MMQ you get a flood of `Cannot find the function: Cijk_Alik_Bljk_HSS_BH_Bias_HA_S_SAV_UserArgs_…` on every Q4 matmul and the slow rocBLAS fallback path runs instead of MMQ's quantised kernels.
+- `--ttsgpu`. `koboldcpp.py` maps that to `inputs.gpulayers=999`, which our patched `kokoro_from_file` reads to decide between the HIP path and the (still-functional) CPU path. Set `$env:VOICE_TTS_KOBOLD_CPU=1` before `start_services.ps1` to force the CPU path back on (A/B debugging; `speak.py` still routes to `:13308` via services.json so `stop_services` + `start_services` is sufficient).
+
+**What's NOT on the GPU yet (and is why perf is mixed on gfx1201):**
+
+- ggml STFT / iSTFT (`GGML_OP_STFT`, `GGML_OP_ISTFT`, `GGML_OP_AA_*`) are still CPU-only. Every call moves O(audio-length) samples host↔device.
+- F32 matmuls (duration predictor, AdaIN gamma/beta projections, conv-via-`mul_mat`) still hit hipBLAS because `ggml_cuda_should_use_mmf`'s F32 case requires Ampere+ or MFMA (neither gfx1201 nor gfx1150 has MFMA; RDNA 4 has WMMA but the MMF F32 template instantiations don't compile for it — see the commented-out experiment in `mmf.cu`). So every F32 matmul pays the rocBLAS-Tensile-lookup-then-fallback cost.
 
 ### Benchmarks (gfx1201 / RX 9070 XT)
 
-| Prompt (chars)            | F5-TTS (GPU)    | Kokoro-PyTorch (GPU, eager) | Kobold Kokoro (CPU) |
-|---------------------------|-----------------|-----------------------------|---------------------|
-| short (12)                | ~0.4 s          | ~1.5 s warm / ~15 s cold    | **0.59 s**          |
-| medium (52)               | ~0.6 s          | ~0.8 s warm                 | **0.50 s**          |
-| long (127)                | ~1.3 s          | ~1.5 s warm                 | **0.93 s**          |
-| poem (402)                | ~2.5 s          | **14.6 s cold** / ~3.2 s    | **3.16 s**          |
-| code (128)                | ~1.2 s          | ~1.5 s warm                 | **0.98 s**          |
-| explain (163)             | ~1.5 s          | ~1.7 s warm                 | **1.26 s**          |
-| total 6 prompts (warm)    | ~8 s            | ~62 s (includes warmup)     | **7.48 s**          |
-| median                    | ~0.9 s          | ~1.5 s                      | **0.96 s**          |
+Current default (`VOICE_TTS=kobold`) vs alternatives on the same 6-prompt set (warm, no first-call inflation):
 
-The Kokoro-PyTorch numbers include `torch._dynamo` shape-warmup that has to run once per unseen input length. Kobold-CPU has no such phase.
+| Prompt (chars)            | Kobold HIP (default)    | F5-TTS (GPU, opt-in)    | Kokoro-PyTorch (exp.)      | Kobold CPU (`VOICE_TTS=cpu`) |
+|---------------------------|-------------------------|-------------------------|----------------------------|------------------------------|
+| short (12)                | 0.45 s                  | **~0.4 s**              | ~1.5 s warm / ~15 s cold   | 0.59 s                       |
+| medium (52)               | 1.15 s                  | ~0.6 s                  | ~0.8 s warm                | **0.50 s**                   |
+| long (127)                | 2.28 s                  | ~1.3 s                  | ~1.5 s warm                | **0.93 s**                   |
+| poem (402)                | 8.18 s                  | ~2.5 s                  | **14.6 s cold** / ~3.2 s   | **3.16 s**                   |
+| code (128)                | 2.33 s                  | ~1.2 s                  | ~1.5 s warm                | **0.98 s**                   |
+| explain (163)             | 2.97 s                  | ~1.5 s                  | ~1.7 s warm                | **1.26 s**                   |
+| total 6 prompts (warm)    | 17.35 s                 | ~8 s                    | ~62 s (includes warmup)    | **7.48 s**                   |
+| median                    | 2.33 s                  | ~0.9 s                  | ~1.5 s                     | **0.96 s**                   |
+
+On this dev box (gfx1201 + TheRock 7.x) the HIP default is slower than the CPU fallback because of the two bottlenecks called out above — the rocBLAS Tensile gap alone costs ~5-10× the per-call-kernel-launch overhead. We're defaulting to HIP anyway because (a) the target test platform is Strix Halo (gfx1150 / XDNA2 NPU) where those bottlenecks don't apply the same way, (b) the fix for the rocBLAS gap is upstream to TheRock rather than ours, and (c) if you want the CPU numbers you're one env var away (`$env:VOICE_TTS="cpu"`).
 
 ## Out of scope (v1)
 

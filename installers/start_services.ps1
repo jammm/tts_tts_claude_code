@@ -79,13 +79,30 @@ function Wait-ForHealth([string]$url, [int]$timeoutSec) {
 $lemPid = Start-Service -Name "lemonade" -ShimPath (Join-Path $Base "run_lemonade.ps1") -ExistingPid (_get $existing "lemonade")
 [void](Wait-ForHealth "http://localhost:13305/api/v1/health" 8)
 
-# 2. TTS. Default is "cpu" = Lemonade's built-in Kokoro on :13305 (no
-# extra process to start). Set VOICE_TTS=f5 for F5-TTS on GPU (:13307,
-# pure-eager PyTorch), VOICE_TTS=kokoro for our ROCm PyTorch Kokoro
-# service (:13306, torch.compile — experimental), or VOICE_TTS=kobold
-# for koboldcpp's HIP build running ttscpp Kokoro on CPU (:13308 —
-# fastest cold start, no python in the hot loop).
-$ttsBackend = if ($env:VOICE_TTS) { $env:VOICE_TTS.ToLower() } else { "cpu" }
+# 2. TTS. Default is "kobold" = koboldcpp's HIP build running Kokoro on
+# the GPU (:13308), provided tools\build_koboldcpp_hip.cmd has been
+# run and a Kokoro GGUF has been dropped into models\. Fallback order
+# when the kobold shim is missing: f5 if F5-TTS shim exists, then cpu
+# (Lemonade's built-in Kokoro on :13305 — always available because
+# lemond ships it).
+#
+# Override per-session with $env:VOICE_TTS before .\installers\
+# start_services.ps1:
+#   kobold  - koboldcpp HIP Kokoro      (:13308, default)
+#   f5      - F5-TTS on GPU             (:13307, eager PyTorch)
+#   kokoro  - ROCm PyTorch Kokoro       (:13306, torch.compile, exp.)
+#   cpu     - Lemonade built-in Kokoro  (:13305)
+$koboldShim = Join-Path $Base "run_kobold.ps1"
+$f5Shim     = Join-Path $Base "run_f5.ps1"
+if ($env:VOICE_TTS) {
+    $ttsBackend = $env:VOICE_TTS.ToLower()
+} elseif (Test-Path $koboldShim) {
+    $ttsBackend = "kobold"
+} elseif (Test-Path $f5Shim) {
+    $ttsBackend = "f5"
+} else {
+    $ttsBackend = "cpu"
+}
 $ttsPid   = 0
 $ttsPort  = 13305
 $ttsLabel = "lemonade (TTS/CPU Kokoro)"
@@ -102,9 +119,8 @@ if ($ttsBackend -eq "kokoro") {
     $ttsPort  = 13307
     $ttsLabel = "f5 (TTS/GPU)"
 } elseif ($ttsBackend -eq "kobold") {
-    $koboldShim = Join-Path $Base "run_kobold.ps1"
     if (-not (Test-Path $koboldShim)) {
-        throw "VOICE_TTS=kobold but run_kobold.ps1 missing. Build koboldcpp_hipblas.dll via tools\build_koboldcpp_hip.cmd then rerun installers\install_windows.ps1"
+        throw "VOICE_TTS=kobold but run_kobold.ps1 missing. Build koboldcpp_hipblas.dll via tools\build_koboldcpp_hip.cmd, place a Kokoro GGUF in models\, then rerun installers\install_windows.ps1"
     }
     $ttsPid = Start-Service -Name "kobold" -ShimPath $koboldShim -ExistingPid (_get $existing "kobold")
     Write-Host "[start] waiting for koboldcpp Kokoro load (up to 60s)..."

@@ -50,7 +50,7 @@
   .\installers\install_windows.ps1 -LemondatePath d:\jam\lemondate -RegisterScheduledTasks
 #>
 
-#Requires -Version 7.0
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)]

@@ -18,17 +18,16 @@ $VoicePluginData = "@@VOICE_PLUGIN_DATA@@"
 
 $VenvPython  = Join-Path $LemondatePath "venv\Scripts\python.exe"
 $DaemonDir   = Join-Path $LemondatePath "ptt"
-$DaemonEntry = Join-Path $DaemonDir "ptt_daemon.py"
 
 $LogDir = Join-Path $VoicePluginData "logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $logFile = Join-Path $LogDir "ptt-$ts.log"
 
-# Make `import ptt.*` resolve to lemondate's ptt tree so the daemon can
-# pull in its sibling modules (recorder, whisper_wake_listener, etc.).
+# Run as a package so `from . import config` works. PYTHONPATH points at
+# lemondate root so `ptt` resolves to $LemondatePath\ptt\.
 $env:PYTHONPATH = $LemondatePath
 
 # cmd.exe's 2>&1 merges stderr into stdout without PowerShell's error
 # stream interpretation getting in the way.
-cmd.exe /c "`"$VenvPython`" `"$DaemonEntry`" 2>&1" > $logFile
+cmd.exe /c "`"$VenvPython`" -m ptt.ptt_daemon 2>&1" > $logFile

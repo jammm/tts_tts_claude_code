@@ -1,10 +1,10 @@
 @echo off
 REM Build whisper.cpp with HIP on Windows. Default target is gfx1201
 REM (Navi 48 / RX 9070 XT), override with GFX_TARGET to retarget — e.g.
-REM `set GFX_TARGET=gfx1150 && tools\build_whisper_hip.cmd clean` for a
+REM `set GFX_TARGET=gfx1151 && tools\build_whisper_hip.cmd clean` for a
 REM Strix Halo deployment build (RDNA 3.5 iGPU). Multiple targets are
 REM allowed as a semicolon-separated list (CMake convention), e.g.
-REM `set GFX_TARGET=gfx1150;gfx1201` for a fat binary covering both
+REM `set GFX_TARGET=gfx1151;gfx1201` for a fat binary covering both
 REM Strix Halo and discrete RDNA 4.
 REM
 REM Runs inside a VS 2022 x64 developer environment + TheRock ROCm toolchain.

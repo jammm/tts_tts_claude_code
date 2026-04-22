@@ -31,7 +31,7 @@ $env:ROCM_SDK_BIN = $RocmBin
 # matmul kernels and avoids rocBLAS entirely for the Q4 path.
 $env:GGML_CUDA_FORCE_MMQ = "1"
 # Reroute rocBLAS's F32 matmul path through hipBLASLt (which has a
-# complete gfx1201 / gfx1150 Tensile kernel set in TheRock, unlike
+# complete gfx1201 / gfx1151 Tensile kernel set in TheRock, unlike
 # rocBLAS itself). Without this, every F32 MUL_MAT in the duration
 # predictor + AdaIN gamma/beta projections + conv-via-mul_mat falls
 # through to rocBLAS's incomplete dispatch and either spins on

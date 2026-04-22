@@ -1,10 +1,10 @@
 @echo off
 REM Build koboldcpp with HIP/HIPBLAS on Windows. Default target is
 REM gfx1201 (Navi 48 / RX 9070 XT), override with GFX_TARGET — e.g.
-REM `set GFX_TARGET=gfx1150 && tools\build_koboldcpp_hip.cmd clean` for
+REM `set GFX_TARGET=gfx1151 && tools\build_koboldcpp_hip.cmd clean` for
 REM a Strix Halo deployment build (RDNA 3.5 iGPU). Multiple targets
 REM are allowed as a semicolon-separated list (CMake convention), e.g.
-REM `set GFX_TARGET=gfx1150;gfx1201` for a fat binary covering both
+REM `set GFX_TARGET=gfx1151;gfx1201` for a fat binary covering both
 REM Strix Halo and discrete RDNA 4.
 REM
 REM koboldcpp is a llama.cpp fork with TTS/STT support including Kokoro,

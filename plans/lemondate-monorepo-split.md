@@ -113,7 +113,7 @@ Phase 4 (sequential): A6 ties off the bench, updates docs, commits.
 
 - **Taskbar/Siri-bubble widget** — will be a separate phase. PTT daemon stays as-is (terminal, CLI logs) for this phase.
 - **Dependency minimisation** — once lemondate builds clean, strip Parler/Dia/Orpheus/Qwen3TTS from ttscpp (or gate them behind CMake flags). Defer till after first end-to-end works.
-- **Strix Halo validation** — re-verify the `GFX_TARGET=gfx1150` path builds from the new lemondate tree. Already parameterised in our existing build scripts.
+- **Strix Halo validation** — re-verify the `GFX_TARGET=gfx1151` path builds from the new lemondate tree. Already parameterised in our existing build scripts.
 
 ## Risks / things to watch
 

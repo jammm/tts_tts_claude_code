@@ -20,7 +20,7 @@ $logFile = Join-Path $LogDir "lemonade-$ts.log"
 # can resolve amdhip64 / hipblas / rocblas / ggml-hip at load time.
 $env:PATH = "$WhisperDir;$RocmBin;" + $env:PATH
 # Route rocBLAS through hipBLASLt — TheRock's rocBLAS for gfx1201 /
-# gfx1150 ships with an incomplete Tensile kernel set, but hipBLASLt
+# gfx1151 ships with an incomplete Tensile kernel set, but hipBLASLt
 # has full coverage. Same fix that gave Kokoro a 7x speedup on the
 # HIP path; whisper's matmul-heavy encoder benefits the same way.
 $env:ROCBLAS_USE_HIPBLASLT = "1"

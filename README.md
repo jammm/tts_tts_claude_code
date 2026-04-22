@@ -119,7 +119,7 @@ rocm-sdk init        # extracts the ROCm runtime into the venv (~1.3 GB)
 .\tools\build_lemonade_cpp.cmd        # ~3 min    -> vendor\lemonade-cpp\lemond.exe
 .\tools\build_whisper_hip.cmd         # ~2 min    -> vendor\whisper-cpp-rocm\whisper-server.exe (ROCm GPU STT)
 .\tools\build_koboldcpp_hip.cmd       # ~10-15 min -> vendor\koboldcpp-rocm\koboldcpp_hipblas.dll (HIP GPU TTS)
-# (Override gfx target with $env:GFX_TARGET="gfx1150" for Strix Halo
+# (Override gfx target with $env:GFX_TARGET="gfx1151" for Strix Halo
 # before running the HIP builds — see Deploying on Strix Halo below.)
 
 # 5. Download the Kokoro GGUF weights koboldcpp will serve
@@ -151,20 +151,20 @@ claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
 
 The Stop hook is also merged into `~/.claude/settings.json` by the installer, so it fires without `--plugin-dir` too.
 
-## Deploying on Strix Halo (gfx1150 iGPU + XDNA2 NPU)
+## Deploying on Strix Halo (gfx1151 iGPU + XDNA2 NPU)
 
-The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The actual target is Strix Halo — Ryzen AI Max+ 395 / Radeon 8060S (gfx1150 iGPU) + 50-TOPS XDNA2 NPU. Three differences matter for deployment:
+The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The actual target is Strix Halo — Ryzen AI Max+ 395 / Radeon 8060S (gfx1151 iGPU) + 50-TOPS XDNA2 NPU. Three differences matter for deployment:
 
 1. **PyTorch / ROCm SDK index URL** — TheRock publishes per-arch nightly wheel indices. Swap `gfx120X-all` for `gfx1151` in step 3:
    ```powershell
    pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch "rocm[libraries,devel]"
    rocm-sdk init
    ```
-   (`gfx1151` is the Lemonade-canonical name for Strix Halo's iGPU; the toolchain ships `gfx1150` cubins under that umbrella because RDNA 3.5 has both ASIC IDs in flight depending on SKU.)
+   (`gfx1151` is Strix Halo's Radeon 8060S iGPU — not to be confused with `gfx1150`, which is Strix Point's Radeon 880M/890M.)
 
 2. **whisper.cpp + koboldcpp HIP builds** — both build scripts now honor `GFX_TARGET`. Set it once and rebuild:
    ```powershell
-   $env:GFX_TARGET = "gfx1150"          # or "gfx1150;gfx1201" for fat binary
+   $env:GFX_TARGET = "gfx1151"          # or "gfx1151;gfx1201" for fat binary
    .\tools\build_whisper_hip.cmd clean
    .\tools\build_koboldcpp_hip.cmd clean
    ```
@@ -356,7 +356,7 @@ After `start_services.ps1`:
 ## Architecture decisions / trade-offs
 
 - **Whisper-based wake word instead of a keyword-spotter.** The original design used openWakeWord ("hey jarvis"), but that limited us to its 5 pre-trained phrases unless we trained a custom model. Reusing the Whisper STT we already run — transcribe each energy-gated speech burst, regex-match the transcript — lets us change the wake phrase to anything with one env var. Cost: one Whisper call per utterance vs. openWakeWord's per-frame inference, but Whisper only runs when someone's actually speaking, so amortized load is modest.
-- **koboldcpp HIP Kokoro as default TTS.** Runs Kokoro on the GPU through the ttscpp backend in our `jammm/koboldcpp jam/gfx1201-hip` fork (four upstream bugs patched so Kokoro even starts a kernel without crashing, plus a fused `snake_1d` megakernel and CUDA kernels for the kcpp ttscpp dirtypatch ops — see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip)). No python in the hot loop, no `torch.compile` recompile cliffs. Latency varies with GPU — on gfx1201 / RX 9070 XT it's ~0.4 s for short prompts and ~8 s for a 400-char paragraph; on Strix Halo (gfx1150) once the NPU path matures it'll be the same or faster. Fallbacks: `VOICE_TTS=cpu` for Lemonade's built-in Kokoro (always available, lemond ships it), `VOICE_TTS=f5` for F5-TTS's flow-matching DiT on GPU.
+- **koboldcpp HIP Kokoro as default TTS.** Runs Kokoro on the GPU through the ttscpp backend in our `jammm/koboldcpp jam/gfx1201-hip` fork (four upstream bugs patched so Kokoro even starts a kernel without crashing, plus a fused `snake_1d` megakernel and CUDA kernels for the kcpp ttscpp dirtypatch ops — see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip)). No python in the hot loop, no `torch.compile` recompile cliffs. Latency varies with GPU — on gfx1201 / RX 9070 XT it's ~0.4 s for short prompts and ~8 s for a 400-char paragraph; on Strix Halo (gfx1151) once the NPU path matures it'll be the same or faster. Fallbacks: `VOICE_TTS=cpu` for Lemonade's built-in Kokoro (always available, lemond ships it), `VOICE_TTS=f5` for F5-TTS's flow-matching DiT on GPU.
 - **F5-TTS over our custom `kokoro_server` as the PyTorch GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py`) for experimentation but isn't default and has torch-compile issues.
 - **Focus gate.** F9 and wake only fire when a `claude.exe` process lives under the foreground window (or when a known terminal-hosting process like Windows Terminal is focused and `claude` is running anywhere on the system). The recorder re-checks just before typing to handle focus drift during Whisper's round-trip.
 - **Stop hook lives in `~/.claude/settings.json`, not just `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks. The installer merges the Stop hook inline so it fires in both `--plugin-dir` and `/plugin install` modes.
@@ -374,7 +374,7 @@ After `start_services.ps1`:
 
 ### Building koboldcpp with HIPBLAS (required — default TTS backend)
 
-`deps/koboldcpp` is pinned to `jammm/koboldcpp jam/gfx1201-hip`. This is our fork of `LostRuins/koboldcpp` with the HIPBLAS build working on Windows + the Kokoro-on-GPU patches (see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip) below for the bug-fix rundown and the fused-op work). We build `koboldcpp_hipblas.dll` for `gfx1201` by default (override with `$env:GFX_TARGET` for other AMD GPUs — `gfx1150` for Strix Halo, `gfx1150;gfx1201` for a fat binary) and stage it at `vendor/koboldcpp-rocm/` alongside `launch_kobold_rocm.py` and koboldcpp's python launcher.
+`deps/koboldcpp` is pinned to `jammm/koboldcpp jam/gfx1201-hip`. This is our fork of `LostRuins/koboldcpp` with the HIPBLAS build working on Windows + the Kokoro-on-GPU patches (see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip) below for the bug-fix rundown and the fused-op work). We build `koboldcpp_hipblas.dll` for `gfx1201` by default (override with `$env:GFX_TARGET` for other AMD GPUs — `gfx1151` for Strix Halo, `gfx1151;gfx1201` for a fat binary) and stage it at `vendor/koboldcpp-rocm/` alongside `launch_kobold_rocm.py` and koboldcpp's python launcher.
 
 ```powershell
 .\tools\build_koboldcpp_hip.cmd          # full build (10-15 minutes)
@@ -456,7 +456,7 @@ HIP is now the fastest backend across the board. For context, before we discover
 
 i.e. **~7× slower** across the board and ~2.5× slower than CPU.
 
-On Strix Halo (gfx1150) the same hipBLASLt switch should do the same thing — TheRock ships gfx1150 Tensile libraries too — and there the NPU will also be on the STT side (see [Deploying on Strix Halo](#deploying-on-strix-halo-gfx1150-igpu--xdna2-npu)).
+On Strix Halo (gfx1151) the same hipBLASLt switch should do the same thing — TheRock ships gfx1151 Tensile libraries too — and there the NPU will also be on the STT side (see [Deploying on Strix Halo](#deploying-on-strix-halo-gfx1151-igpu--xdna2-npu)).
 
 ## Out of scope (v1)
 

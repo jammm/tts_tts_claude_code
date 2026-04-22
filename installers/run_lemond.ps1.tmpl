@@ -74,11 +74,25 @@ if (-not $env:KOKORO_HIP_CRASH_DUMP_DIR) {
 # pre-set env var wins so users on Strix Halo can flip to NPU just by
 # setting
 #   $env:LEMONADE_WHISPER_BACKEND = "npu"
-# before .\installers\start_services.ps1. Default is rocm if lemondate's
-# whisper-server.exe is present, otherwise cpu.
+# before .\installers\start_services.ps1.
+#
+# Default selection (in priority order):
+#   1. User-set LEMONADE_WHISPER_BACKEND wins unconditionally.
+#   2. If %RYZEN_AI_INSTALLATION_PATH% is set, the host has the Ryzen
+#      AI Software installed on purpose -> try NPU first. lemond's
+#      WhisperServer will fall back to a warning + error if no XDNA 2
+#      device is enumerated.
+#   3. If lemondate's own whisper-server.exe is present, use ROCm.
+#   4. CPU as last resort.
 $whisperBackend = $env:LEMONADE_WHISPER_BACKEND
 if (-not $whisperBackend) {
-    if (Test-Path $WhisperExe) { $whisperBackend = "rocm" } else { $whisperBackend = "cpu" }
+    if ($env:RYZEN_AI_INSTALLATION_PATH -and (Test-Path "$env:RYZEN_AI_INSTALLATION_PATH\deployment\onnxruntime.dll")) {
+        $whisperBackend = "npu"
+    } elseif (Test-Path $WhisperExe) {
+        $whisperBackend = "rocm"
+    } else {
+        $whisperBackend = "cpu"
+    }
 }
 Write-Host "[lemond] whisper backend: $whisperBackend"
 
@@ -108,7 +122,20 @@ if ($whisperBackend -eq "npu") {
     # Krackan). Lemonade's WhisperServer enforces the device check and
     # will print "Backend not supported on this device" if there's no
     # NPU.
+    #
+    # Users who want lemondate fully self-contained can drop a
+    # pre-built amd/whisper.cpp NPU binary at lemondate\bin\whisper-
+    # server-npu.exe and set LEMONADE_WHISPERCPP_NPU_BIN; that wins
+    # over lemond's auto-download. See docs/strix-halo.md in the
+    # lemondate repo for the full build instructions.
     $env:LEMONADE_WHISPERCPP = "npu"
+    if (-not $env:LEMONADE_WHISPERCPP_NPU_BIN) {
+        $npuBin = Join-Path $LemondateBin 'whisper-server-npu.exe'
+        if (Test-Path $npuBin) {
+            $env:LEMONADE_WHISPERCPP_NPU_BIN = $npuBin
+            Write-Host "[lemond]   using local NPU whisper binary: $npuBin"
+        }
+    }
 }
 if ($whisperBackend -eq "cpu") {
     $env:LEMONADE_WHISPERCPP = "cpu"

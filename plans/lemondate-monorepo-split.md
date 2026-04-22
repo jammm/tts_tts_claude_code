@@ -1,6 +1,6 @@
 # lemondate monorepo split
 
-Create a new `jammm/lemondate` GitHub repo that absorbs everything currently coming out of `deps/{lemonade, whisper.cpp, llama.cpp, koboldcpp}` as first-class source (no submodules, no GitHub-release downloads at runtime). lemondate builds `lemond.exe` + a whisper-ROCm server + a koboldcpp-HIP Kokoro server from one tree; its only external dep is TheRock's ROCm SDK. This repo (`tts_tts_claude_code`) keeps the Claude plugin + installer + PTT daemon; its installer calls into lemondate's prebuilt artifacts. Parallelised across 4 subagents.
+Create a new `jammm/lemondate` GitHub repo that absorbs everything currently coming out of `deps/{lemonade, whisper.cpp, llama.cpp, koboldcpp}` + this repo's `ptt/` daemon as first-class source (no submodules, no GitHub-release downloads at runtime). lemondate builds `lemond.exe` + a whisper-ROCm server + a koboldcpp-HIP Kokoro server from one tree and ships the Python PTT/wake-word daemon next to them; its only external dep is TheRock's ROCm SDK (plus a Python runtime for ptt/). This repo (`tts_tts_claude_code`) keeps just the Claude plugin + installer; its installer calls into lemondate's prebuilt artifacts and renders shims that point at lemondate's `ptt/` and `bin/`. Parallelised across 5 subagents.
 
 ## Todos
 
@@ -9,7 +9,8 @@ Create a new `jammm/lemondate` GitHub repo that absorbs everything currently com
 | `a1_scaffold` | pending | **A1 SEQUENTIAL** Create `jammm/lemondate` empty repo; seed from `jammm/lemonade` `jam/windows-rocm-whisper` branch (our existing lemonade fork with the `WhisperServer` rocm patch). Establish top-level `CMakeLists.txt` with a `src/` layout (`src/lemond`, `src/whisper`, `src/ttscpp`, `src/ggml`, `assets/`). Add a root `build.cmd` that builds all three binaries (`lemond`, `whisper-server`, `kokoro-hip-server`) with one invocation. Drop lemonade's `install_backend` download-from-github logic so binaries are always found in local install tree. |
 | `a2_ttscpp_embed` | pending | **A2 PARALLEL** Copy `deps/koboldcpp/otherarch/ttscpp/` into `lemondate/src/ttscpp/`. Port our kokoro-HIP patches (128-byte alignment in `tts_model::set_tensor` + `post_load_assign`, reciprocal rewrite, `set_inputs` `ggml_backend_tensor_set` switch, `window_cpu_cache`, shared backend pattern) from `jam/gfx1201-hip` `8fac50bf7`. Port `snake_1d` fused megakernel (`snake.cu`) + `ttscpp_ops.cu` (CUDA kernels for mod / cumsum_tts / ttsround / reciprocal / upscale_linear / conv_transpose_1d_tts / stft / istft) from `e97ae3f80` and today's in-flight work. Write a new `src/kokoro-hip-server/main.cpp` that spawns a `cpp-httplib` server exposing `/v1/audio/speech` by calling ttscpp's `generate()` path. |
 | `a3_whisper_ggml_unify` | pending | **A3 PARALLEL** Copy `deps/whisper.cpp` into `lemondate/src/whisper/`. Replace whisper's bundled ggml with our unified `src/ggml/` (from `deps/llama.cpp/ggml` + our kcpp dirtypatch ops `GGML_OP_SNAKE_1D` / `MOD` / `CUMSUM_TTS` / `STFT` / `ISTFT` / `upscale_linear` / `conv_transpose_1d_tts` / `reciprocal` / `ttsround`). Ensure `whisper-server.exe` still builds + runs with the unified ggml. Wire `whisper-server.exe` into lemondate's CMake as a first-class target. Resolve any conflicts where whisper's ggml version differs from llama.cpp's. |
-| `a5_this_repo_cleanup` | pending | **A5 PARALLEL** Delete `deps/{koboldcpp, whisper.cpp, llama.cpp, lemonade}` submodules + `.gitmodules` entries. Delete `vendor/{lemonade-cpp, whisper-cpp-rocm, koboldcpp-rocm}`. Delete `tools/build_lemonade_cpp.cmd`, `build_whisper_hip.cmd`, `build_koboldcpp_hip.cmd`, `launch_kobold_rocm.py`. Merge `run_lemonade.ps1.tmpl` + `run_kobold.ps1.tmpl` into a single `run_lemond.ps1.tmpl` (lemondate's single binary). Rewrite `installers/install_windows.ps1` to take `-LemondatePath` and render the merged shim. Update `README.md` bootstrap section for the new two-repo flow. |
+| `a5_this_repo_cleanup` | pending | **A5 PARALLEL** Delete `deps/{koboldcpp, whisper.cpp, llama.cpp, lemonade}` submodules + `.gitmodules` entries. Delete `vendor/{lemonade-cpp, whisper-cpp-rocm, koboldcpp-rocm}`. Delete `tools/build_lemonade_cpp.cmd`, `build_whisper_hip.cmd`, `build_koboldcpp_hip.cmd`, `launch_kobold_rocm.py`. Delete `ptt/` (moved to lemondate — see A7). Merge `run_lemonade.ps1.tmpl` + `run_kobold.ps1.tmpl` into a single `run_lemond.ps1.tmpl` (lemondate's single binary). Retarget `installers/run_ptt.ps1.tmpl` at `<LemondatePath>/ptt/ptt_daemon.py` (keep the shim in this repo — installer still owns process supervision). Rewrite `installers/install_windows.ps1` to take `-LemondatePath` and render the merged shim. Update `README.md` bootstrap section for the new two-repo flow. |
+| `a7_ptt_port` | pending | **A7 PARALLEL** Copy this repo's [ptt/](../ptt/) tree (`ptt_daemon.py`, `recorder.py`, `whisper_wake_listener.py`, `window_check.py`, `config.py`, `f5_tts_server.py`, `kokoro_server.py`, `__init__.py`) into `lemondate/ptt/` verbatim. Add a `lemondate/ptt/requirements.txt` capturing today's pins (pynput, requests, aiohttp, numpy, sounddevice, torch-via-rocm-sdk, etc. — pull from existing `.venv` freeze). Add a top-level `lemondate/install_ptt.py` or `ptt/install.ps1` that sets up the venv inside `lemondate/` and installs the deps so the PTT daemon can run standalone from a lemondate install tree. Document the daemon in lemondate's README. Do not change daemon logic — this is a verbatim relocation so the existing shim in this repo just re-points its script path. |
 | `a4_lemond_wiring` | pending | **A4 SEQUENTIAL (needs A2+A3)** Extend `KokoroServer::get_install_params` with `hip` backend option (returns empty repo/filename, like `WhisperServer`'s `rocm`). Extend `KokoroServer::load` to handle `kokoros_backend=hip` by launching `kokoro-hip-server.exe` from `LEMONADE_KOKORO_HIP_BIN`. Add env var plumbing for `LEMONADE_KOKORO_BACKEND` + `LEMONADE_KOKORO_HIP_BIN` + `LEMONADE_KOKORO_ARGS` to `config_file.cpp` (parallel to `LEMONADE_WHISPERCPP_*` we already added). Set `ROCBLAS_USE_HIPBLASLT=1` inside lemond's process environment at startup (alt: inside the `kokoro-hip-server.exe` / `whisper-server.exe` startup) so we don't need a shim layer to do it. |
 | `a6_integrate_bench` | pending | **A6 SEQUENTIAL** End-to-end bench on this dev box (Threadripper + RX 9070 XT gfx1201). Verify new `kokoro-hip-server.exe` matches current `koboldcpp_hipblas.dll` numbers (0.37s median, 1.30s poem). Verify whisper ROCm still works. Verify `speak.py`'s `services.json` routing picks the right port when `lemond` spawns `kokoro-hip-server`. Audio quality sanity-check (correlation of same-input-different-RNG outputs vs CPU baseline; catches any STFT/iSTFT/conv_transpose kernel bugs we may have reintroduced — today's debug run caught correlation=0.04 on the current build, must fix before lemondate inherits). Bump submodule pointer references, commit + push both repos. |
 
@@ -19,7 +20,6 @@ Create a new `jammm/lemondate` GitHub repo that absorbs everything currently com
 graph LR
     subgraph this [this repo: jammm/tts_tts_claude_code]
         plugin[Claude plugin]
-        ptt[ptt_daemon Python]
         installer[installers + shims]
     end
 
@@ -28,12 +28,14 @@ graph LR
         whisper_exe[whisper-server.exe ROCm]
         kokoro_exe[kokoro-hip-server.exe ttscpp]
         shared_ggml[src/ggml shared tree]
+        ptt[ptt_daemon Python]
     end
 
     subgraph external [external only]
         therock[TheRock rocm-sdk-devel pip wheel]
     end
 
+    installer -.renders shim.-> ptt
     plugin -->|HTTP 13305| lemond
     ptt -->|HTTP 13305| lemond
     lemond -.spawns.-> whisper_exe
@@ -55,6 +57,7 @@ Seed from current [deps/lemonade](../deps/lemonade) (already on `jam/windows-roc
 | ttscpp (Kokoro only for now) | `src/ttscpp/` | deps/koboldcpp/otherarch/ttscpp/ + our kokoro-HIP patches |
 | Shared ggml + ggml-cuda | `src/ggml/` | current deps/llama.cpp/ggml, plus our `snake.cu`, `ttscpp_ops.cu`, `GGML_OP_SNAKE_1D` + stft/istft/upscale_linear/conv_transpose_1d_tts additions |
 | embd_res / phonemizer data | `assets/` | from deps/koboldcpp/embd_res/ |
+| PTT / wake-word daemon + Python TTS servers | `ptt/` | this repo's [ptt/](../ptt/) (ptt_daemon.py, recorder.py, whisper_wake_listener.py, window_check.py, config.py, f5_tts_server.py, kokoro_server.py) verbatim |
 
 One shared `src/ggml/` tree — whisper-server + kokoro-hip-server both build against it. Avoids the ggml-overlay hack from `tools/build_whisper_hip.cmd`.
 
@@ -80,39 +83,51 @@ Build target: `kokoro-hip-server`. Binary output `bin/kokoro-hip-server.exe`.
 
 This replaces `vendor/koboldcpp-rocm/launch_kobold_rocm.py` + the full `koboldcpp.py`. lemond launches the exe directly — no python shim in between.
 
+## PTT daemon in lemondate
+
+The whole [ptt/](../ptt/) tree moves verbatim into `lemondate/ptt/`. Files: `ptt_daemon.py` (F9 hotkey + wake-word orchestrator), `recorder.py` (VAD + mic capture), `whisper_wake_listener.py` (wake-word via STT), `window_check.py` (focus gate), `config.py`, `f5_tts_server.py`, `kokoro_server.py` (legacy Python GPU TTS paths — staying for A/B until HIP Kokoro fully matures), `__init__.py`.
+
+lemondate owns the Python runtime: it provisions a `lemondate/venv/` (Python 3.12 + TheRock's `rocm[libraries,devel]` wheel + `torch` built against it + the ptt daemon's pip requirements). `lemondate/ptt/requirements.txt` captures today's pins.
+
+This repo's installer keeps ownership of process supervision — the pidfile layout, focus-gate integration with Claude Code, the `tts_active.lock` coordination with `speak.py` — but it now launches `<LemondatePath>/ptt/ptt_daemon.py` via `<LemondatePath>/venv/Scripts/python.exe` instead of its own `.venv\Scripts\python.exe ptt\ptt_daemon.py`. Only [installers/run_ptt.ps1.tmpl](../installers/run_ptt.ps1.tmpl) needs to change — everything downstream (`start_services.ps1`, `stop_services.ps1`, the pidfile convention) stays.
+
 ## Changes in THIS repo (`tts_tts_claude_code`)
 
 - Delete: `deps/koboldcpp`, `deps/whisper.cpp`, `deps/llama.cpp`, `deps/lemonade` submodules. Remove from `.gitmodules`.
 - Delete: `vendor/{lemonade-cpp, whisper-cpp-rocm, koboldcpp-rocm}` (produced by lemondate now).
 - Delete: `tools/build_lemonade_cpp.cmd`, `tools/build_whisper_hip.cmd`, `tools/build_koboldcpp_hip.cmd`, `tools/launch_kobold_rocm.py`.
-- Keep: [ptt/](../ptt/), [claude-plugin-voice/](../claude-plugin-voice/), [installers/](../installers/), [README.md](../README.md).
+- Delete: [ptt/](../ptt/) (moved wholesale into lemondate — A7 owns the copy, A5 owns the deletion here).
+- Keep: [claude-plugin-voice/](../claude-plugin-voice/), [installers/](../installers/), [README.md](../README.md).
 - [installers/install_windows.ps1](../installers/install_windows.ps1): new arg `-LemondatePath` pointing at a prebuilt lemondate install (or we fetch a release). Shim templates ([installers/run_lemonade.ps1.tmpl](../installers/run_lemonade.ps1.tmpl) + [installers/run_kobold.ps1.tmpl](../installers/run_kobold.ps1.tmpl) — merged into one `run_lemond.ps1.tmpl` since lemond orchestrates everything now) point at lemondate's `bin/lemond.exe`.
-- [README.md](../README.md): Bootstrap section rewritten — clone lemondate, build it once, then install this repo's plugin on top.
+- [installers/run_ptt.ps1.tmpl](../installers/run_ptt.ps1.tmpl): stays here (installer still owns process supervision + pidfiles + logs) but is retargeted to launch `<LemondatePath>/ptt/ptt_daemon.py` via `<LemondatePath>/venv/Scripts/python.exe`. Venv comes from lemondate's install (owned by A7), not from this repo anymore.
+- [README.md](../README.md): Bootstrap section rewritten — clone lemondate, build it once (the build provisions both `bin/*.exe` and `ptt/` + its venv), then install this repo's plugin on top.
 
 `VOICE_TTS=cpu|hip|f5|kokoro` still works; defaults to `hip` (which is now Lemonade's `kokoros_backend=hip` talking to kokoro-hip-server.exe).
 
-## Parallelisation (4 agents)
+## Parallelisation (5 agents)
 
 ```mermaid
 graph LR
     A1[A1: create jammm/lemondate, seed from jammm/lemonade, top-level CMake] --> A2[A2: vendor ttscpp + our HIP patches, build kokoro-hip-server.exe]
     A1 --> A3[A3: vendor whisper.cpp + ggml overlay, unify with ttscpp s ggml tree]
+    A1 --> A7[A7: copy this repo s ptt/ into lemondate/ptt/, add requirements.txt + venv bootstrap]
     A2 --> A4[A4: wire lemond s KokoroServer hip option, env vars, router]
     A3 --> A4
-    A1 --> A5[A5: gut this repo s deps / vendor / tools, rewrite installer + README]
+    A1 --> A5[A5: gut this repo s deps / vendor / tools / ptt, rewrite installer + README]
     A4 --> A6[A6: end to end bench + sanity, commit everything]
     A5 --> A6
+    A7 --> A6
 ```
 
 Phase 1 (sequential): A1 creates the scaffold.
-Phase 2 (parallel, 3 agents): A2, A3, A5 run simultaneously on disjoint file sets.
+Phase 2 (parallel, 4 agents): A2, A3, A5, A7 run simultaneously on disjoint file sets.
 Phase 3 (sequential): A4 wires lemond to the new binaries (needs A2+A3 done).
-Phase 4 (sequential): A6 ties off the bench, updates docs, commits.
+Phase 4 (sequential): A6 ties off the bench (new ptt install path included), updates docs, commits.
 
 ## Deferred to follow-ups
 
-- **Taskbar/Siri-bubble widget** — will be a separate phase. PTT daemon stays as-is (terminal, CLI logs) for this phase.
-- **Dependency minimisation** — once lemondate builds clean, strip Parler/Dia/Orpheus/Qwen3TTS from ttscpp (or gate them behind CMake flags). Defer till after first end-to-end works.
+- **Taskbar/Siri-bubble widget** — will be a separate phase. PTT daemon lands in lemondate as-is this round (terminal UI, CLI logs); the bubble UI is a new process that the daemon will drive later.
+- **Dependency minimisation** — once lemondate builds clean, strip Parler/Dia/Orpheus/Qwen3TTS from ttscpp (or gate them behind CMake flags). Likewise trim `ptt/f5_tts_server.py` + `ptt/kokoro_server.py` (the Python GPU TTS paths) once the C++ HIP Kokoro server covers everything we need — they move in with A7 but are candidates for deletion later. Defer till after first end-to-end works.
 - **Strix Halo validation** — re-verify the `GFX_TARGET=gfx1151` path builds from the new lemondate tree. Already parameterised in our existing build scripts.
 
 ## Risks / things to watch
@@ -120,3 +135,4 @@ Phase 4 (sequential): A6 ties off the bench, updates docs, commits.
 - **ggml unification**: whisper.cpp's ggml and koboldcpp's ggml have diverged. Picking llama.cpp's ggml as the unified tree (what we already overlay onto whisper.cpp) means we need to port our koboldcpp kcpp-dirtypatch ops (GGML_OP_SNAKE_1D, MOD, CUMSUM_TTS, STFT, ISTFT, upscale_linear, conv_transpose_1d_tts, reciprocal, ttsround) + our CUDA kernels from deps/koboldcpp/ggml/ into the unified tree. A3 owns this merge.
 - **Kokoro GGUF loading format**: ttscpp reads its own GGUF layout (kokoro-specific metadata keys). No conversion needed — the existing `models/Kokoro_no_espeak_Q4.gguf` from [huggingface.co/koboldcpp/tts](https://huggingface.co/koboldcpp/tts) works as-is.
 - **hipBLASLt env var**: `ROCBLAS_USE_HIPBLASLT=1` is what gave us the 7× speedup in the current setup. lemondate's shim needs to set it (the run_lemonade.ps1.tmpl equivalent in lemondate, or baked into `lemond.exe` itself via `setenv` on startup).
+- **Python venv ownership split**: lemondate now owns the Python runtime used by the PTT daemon, but this repo's installer still decides when the daemon starts and where its pidfile lives. Make sure the A7 install script + A5 retargeted `run_ptt.ps1.tmpl` agree on the venv path (`<LemondatePath>/venv/Scripts/python.exe`) and the ptt module root (`<LemondatePath>/ptt/`). If users have a pre-existing `.venv` from the old layout in this repo, A5 should leave it alone (don't wipe user data) but the installer should ignore it.

@@ -342,52 +342,22 @@ What's patched upstream (`deps/koboldcpp/CMakeLists.txt`, in our fork):
 - `clang++.exe` (GNU driver) instead of `amdclang-cl.exe` (MSVC driver) as the CXX compiler. The clang-cl driver names HIP offload-bundler intermediates `*.exe` (MSVC conventions) and then the bundler can't find them; the GNU driver produces `*.o` like the HIP toolchain expects.
 - Added every `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*.cu` to `GGML_SOURCES_CUDA`. Upstream only listed a subset explicitly, which worked because their CUDA CMake glob caught the rest; on our HIP-only path the linker failed with "undefined symbol: `ggml_cuda_flash_attn_ext_vec_case<64,1,1>`" etc.
 
-### Kokoro on the GPU (HIP)
-
-Upstream koboldcpp ships `--ttsgpu` for OuteTTS / Q3TTS only; ttscpp's Kokoro path was hardcoded to CPU. Our fork actually runs Kokoro on HIP. Four bugs had to be fixed in lockstep before it would even start a kernel without crashing — they're documented in the koboldcpp submodule commit but worth summarising:
-
-1. **Tensor alignment in `tts_model::set_tensor` / `kokoro_model::post_load_assign`.** The Kokoro loader manually places weights with `tensor->data = base + offset` and then `offset += ggml_nbytes(target)` — no padding. The CUDA/HIP buffer requires 128-byte alignment per tensor, so e.g. `noise_blocks.0.resblock.0.alpha1` ended up with a device pointer ending in `0x1E` and HIP rejected the very first kernel that touched it (`MUL failed`, `ROCm error: unspecified launch failure`). Fix: round `offset` up to `ggml_backend_buft_get_alignment(buffer)` before each tensor placement, and over-allocate the buffer by `n_tensors * (alignment - 1)` so the rounding can never run past the end.
-2. **`reciprocal()` in `ttsutil.cpp` set `tensor->data = &one`** — a host-side `static constexpr float`. The "ones" tensor with stride 0 was a clever broadcast trick on CPU but crashes immediately when a GPU kernel dereferences the host pointer. Rewrote as `ggml_div(x, ggml_mul(x, x))`, which is `1/x` for any non-zero x using only standard ops the scheduler can place on either backend (alphas are learnable params and never zero in practice).
-3. **`set_inputs()` in both `kokoro_runner` and `kokoro_duration_runner`** wrote `positions / attn_mask / uv_noise_data / duration_mask` directly via `((T*)tensor->data)[i] = …`. On GPU those are device pointers. Rewrote both to build the data in CPU `std::vector` staging buffers and upload via `ggml_backend_tensor_set`. Same dance for `compute_window_squared_sum`, which used to dereference `model->decoder->generator->window->data` as CPU memory — the window is now cached on CPU in `model->window_cpu_cache` during `post_load_assign`.
-4. **Shared backend.** `kokoro_model`, `kokoro_duration_context`, and `kokoro_context` each created their own `ggml_backend_cuda_init(0)`, producing three independent HIP streams. Their interleaving made the very first `MUL` kernel error out on gfx1201 / TheRock 7.x. The fork keeps a single backend instance owned by `kokoro_model` and borrows it (with `owned_backend = false`) for both kctxes so the destructor doesn't double-free.
-
-Plus three runtime knobs the shim sets:
-
-- `GGML_CUDA_FORCE_MMQ=1` and koboldcpp's `--usecuda normal 0 mmq`. TheRock's rocBLAS for gfx1201 ships an incomplete Tensile kernel set — without MMQ you get a flood of `Cannot find the function: Cijk_Alik_Bljk_HSS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x32_…` from hipBLAS and the slow rocBLAS fallback path runs instead of MMQ's quantised kernels.
-- `--ttsgpu` (already wired by `installers\run_kobold.ps1.tmpl`). koboldcpp.py maps it to `inputs.gpulayers=999`, which our patched `kokoro_from_file` reads to decide between CPU and the new HIP path. Set `$env:VOICE_TTS_KOBOLD_CPU=1` before `start_services.ps1` to force the old CPU path back on (useful for A/B-ing against the GPU build).
-
-### Op fusion / megakernel work for Kokoro on HIP
-
-The HIP path was 2-3× slower than CPU for long prompts despite running entirely on the GPU. Two pieces of upstream work + experiments after the initial port:
-
-1. **Fused `snake_1d` megakernel** as a new `GGML_OP_SNAKE_1D` op (`ggml_snake_1d(a, alpha)`). Snake activation is `a + sin²(a*α) / α`, which `ttsutil.cpp::snake_1d` previously expanded to a 7-op subgraph (mul, sin, sqr, mul, div, mul, add — the inner reciprocal expanded to `div(x, mul(x, x))` as part of [GPU bug fix #2 in the previous commit](#kokoro-on-the-gpu-hip)). Kokoro calls snake_1d 50+ times per inference (every AdaIN res block + every noise res block), so that was 350 hipLaunchKernel + 300 intermediate buffer allocs + 300 sync points worth of overhead. Now one fused kernel — CPU path in `ggml-cpu.c::ggml_compute_forward_snake_1d_f32`, CUDA / HIP path in `ggml/src/ggml-cuda/snake.cu`, op rejection in `supports_op` so non-F32 / non-broadcasting alpha falls back to CPU rather than dispatching incorrectly.
-2. **CUDA implementations of the kcpp dirtypatch ttscpp ops** in `ggml/src/ggml-cuda/ttscpp_ops.cu`: `GGML_OP_RECIPROCAL`, `GGML_OP_TTSROUND`, `GGML_OP_MOD`, `GGML_OP_CUMSUM_TTS`. Upstream had only CPU impls in `ggml-cpu.c`, so every call to one of these inside an otherwise-GPU graph triggered a GPU→host→GPU bounce around the op. Kokoro fires `ggml_mod` once per `build_sin_gen` and `ggml_cumsum_tts` once per generator block on the audio rate path, so on long outputs that's a lot of pingpong saved.
-
-Two experiments that landed back commented-out:
-
-- **HIP graph capture** (`GGML_HIP_GRAPHS` define + relaxed `ADD with src[1]->ne[1] > 1` graph-disable check, the latter gated behind `GGML_DISABLE_BCAST_ADD_GRAPHS=1` for opt-out). Compiles fine and helps short prompts marginally, but graph capture crashes mid-poem on gfx1201 / TheRock 7.x — the per-call shape changes seem to outpace `hipGraphInstantiate`'s cost. Will revisit when graph caching across calls or TheRock's HIP graph stability improves.
-- **F32 mmf for RDNA** (`mmf.cu::ggml_cuda_should_use_mmf`'s F32 case extended with `amd_wmma_available()`). Routes F32 matmuls through ggml's own MMA kernel instead of falling through to hipBLAS, which would dodge the rocBLAS Tensile gap that produces "Cannot find the function: Cijk_Alik_Bljk_S_…" log spew on every F32 matmul. Hangs the koboldcpp process indefinitely on the first launch — F32 mmf template instantiations probably require MFMA intrinsics not present on RDNA. Notes left in `mmf.cu` so we don't redo it.
+Note: `VOICE_TTS=kobold` runs Kokoro on **CPU** even though the DLL is HIP-enabled. ttscpp (koboldcpp's TTS engine) doesn't have a GPU Kokoro path upstream — see the comment in `deps/koboldcpp/otherarch/ttscpp/src/ttscpp.cpp::kokoro_from_file`. We tried wiring one (commits available on `jam/gfx1201-hip` reachable via reflog: `8fac50bf7` "Run Kokoro TTS on GPU (HIP) for gfx1201" + `e97ae3f80` "Fused snake_1d megakernel + CUDA kernels for ttscpp dirtypatch ops"); it works correctly but ends up slower than the ggml CPU backend on this gfx1201 / TheRock build because (a) Kokoro is 82 M params with thousands of small ops where per-op kernel-launch latency dominates and (b) TheRock's rocBLAS for gfx1201 ships an incomplete Tensile kernel set so every F32 matmul logs `Cannot find the function: Cijk_Alik_Bljk_S_…` and falls back to a slow generic implementation. Revisit when either bottleneck moves.
 
 ### Benchmarks (gfx1201 / RX 9070 XT)
 
-| Prompt (chars)            | F5-TTS (GPU)    | Kokoro-PyTorch (GPU, eager) | Kobold Kokoro (HIP) | Kobold Kokoro (CPU) |
-|---------------------------|-----------------|-----------------------------|---------------------|---------------------|
-| short (12)                | ~0.4 s          | ~1.5 s warm / ~15 s cold    | **0.45 s**          | 0.59 s              |
-| medium (52)               | ~0.6 s          | ~0.8 s warm                 | 1.15 s              | **0.50 s**          |
-| long (127)                | ~1.3 s          | ~1.5 s warm                 | 2.28 s              | **0.93 s**          |
-| poem (402)                | ~2.5 s          | **14.6 s cold** / ~3.2 s    | 8.18 s              | **3.16 s**          |
-| code (128)                | ~1.2 s          | ~1.5 s warm                 | 2.33 s              | **0.98 s**          |
-| explain (163)             | ~1.5 s          | ~1.7 s warm                 | 2.97 s              | **1.26 s**          |
-| total 6 prompts (warm)    | ~8 s            | ~62 s (includes warmup)     | 17.35 s             | **7.48 s**          |
-| median                    | ~0.9 s          | ~1.5 s                      | 2.33 s              | **0.96 s**          |
+| Prompt (chars)            | F5-TTS (GPU)    | Kokoro-PyTorch (GPU, eager) | Kobold Kokoro (CPU) |
+|---------------------------|-----------------|-----------------------------|---------------------|
+| short (12)                | ~0.4 s          | ~1.5 s warm / ~15 s cold    | **0.59 s**          |
+| medium (52)               | ~0.6 s          | ~0.8 s warm                 | **0.50 s**          |
+| long (127)                | ~1.3 s          | ~1.5 s warm                 | **0.93 s**          |
+| poem (402)                | ~2.5 s          | **14.6 s cold** / ~3.2 s    | **3.16 s**          |
+| code (128)                | ~1.2 s          | ~1.5 s warm                 | **0.98 s**          |
+| explain (163)             | ~1.5 s          | ~1.7 s warm                 | **1.26 s**          |
+| total 6 prompts (warm)    | ~8 s            | ~62 s (includes warmup)     | **7.48 s**          |
+| median                    | ~0.9 s          | ~1.5 s                      | **0.96 s**          |
 
-The HIP path wins on very short prompts but still loses on longer ones. Three structural reasons (none of them in our code):
-
-- Kokoro is 82 M params with thousands of small ops per inference (Albert encoder layers, two LSTMs, then 4 ada-IN res blocks × 2 inner layers × ~30 ops each in the decoder). Per-op kernel-launch latency dominates when per-op work is tiny — `AMD_LOG_LEVEL=3` shows ~4300 `hipLaunchKernel` calls + 856 `hipMemcpyAsync` calls + 864 `hipStreamSynchronize` calls for a single short-prompt inference. Op fusion helps but the residual count is still high.
-- **TheRock's rocBLAS Tensile kernel set is incomplete for gfx1201.** The same trace shows 84 "Cannot find the function: Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_…" lines per inference. With `--usecuda mmq` + `GGML_CUDA_FORCE_MMQ=1` we route Q4 matmuls through ggml's own MMQ, but every F32 matmul (duration predictor, AdaIN gamma/beta projections, conv-via-mul_mat) still hits hipBLAS and pays the Tensile-lookup-then-fallback cost. Until TheRock ships a complete kernel set or we can compile out the cuBLAS path on RDNA, this dominates per-token cost.
-- ggml STFT / iSTFT (`GGML_OP_STFT`, `GGML_OP_ISTFT`, `GGML_OP_AA_*`) are still CPU-only in this fork. Each call moves O(audio-length) data to host and back. Long prompts have proportionally more iSTFT work, which is why the gap to CPU widens with input length.
-
-If you only care about throughput, stay on `VOICE_TTS=kobold` with the default CPU path (or `VOICE_TTS=f5` for GPU). The HIP Kokoro path is in for parity (it does what it says — runs on the GPU) and so the alignment / `reciprocal` / scheduler / fused-snake / ttscpp-CUDA fixes are upstreamable independent of how you actually want to run inference.
+The Kokoro-PyTorch numbers include `torch._dynamo` shape-warmup that has to run once per unseen input length. Kobold-CPU has no such phase.
 
 ## Out of scope (v1)
 

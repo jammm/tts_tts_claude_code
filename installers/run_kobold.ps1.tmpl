@@ -6,9 +6,14 @@
 # search path (amdhip64_7 / hipblas / rocblas), which launch_kobold_rocm
 # .py handles.
 #
-# Kokoro is patched to actually run on GPU (HIP) with our fork — see
-# the GPU-Kokoro section in README. Set $env:VOICE_TTS_KOBOLD_CPU=1
-# before .\installers\start_services.ps1 to force CPU instead.
+# Kokoro runs on CPU here (ttscpp Kokoro is hardcoded cpu_only=true in
+# the submodule — see the comment in deps/koboldcpp/otherarch/ttscpp/
+# src/ttscpp.cpp::kokoro_from_file). The HIP build was tried; runs
+# correctly but ends up slower than the ggml CPU backend on gfx1201
+# because of TheRock's incomplete rocBLAS Tensile kernel set, and
+# Kokoro is small enough (82 M params, thousands of small ops) that
+# per-op kernel-launch latency dominates anyway. The HIP DLL is still
+# what we load — it just stays out of Kokoro's hot path.
 
 $VenvPython   = "__VENV_PYTHON__"
 $KoboldDir    = "__KOBOLD_DIR__"
@@ -23,17 +28,9 @@ $logFile = Join-Path $LogDir "kobold-$ts.log"
 
 $env:PATH         = "$RocmBin;" + $env:PATH
 $env:ROCM_SDK_BIN = $RocmBin
-# Force MMQ for quantized matmul. TheRock's rocBLAS for gfx1201 ships
-# without large parts of its Tensile kernel set; with MMQ off, ggml-cuda
-# falls through to rocBLAS for the LLM-style matmuls and hits "Cannot
-# find the function: Cijk_..." cascades. MMQ uses ggml's own quantized-
-# matmul kernels and avoids rocBLAS entirely for the Q4 path.
-$env:GGML_CUDA_FORCE_MMQ = "1"
 
-# --usecuda picks koboldcpp_hipblas.dll, mmq forces the matmul path
-# above. --ttsgpu sets inputs.gpulayers=999 which is what our patched
-# kokoro_from_file checks. --skiplauncher skips the GUI, --nomodel
-# keeps the LLM side offline, --port 13308 is our convention.
-$ExtraArgs = ""
-if ($env:VOICE_TTS_KOBOLD_CPU -eq "1") { $ExtraArgs = "" } else { $ExtraArgs = "--ttsgpu" }
-cmd.exe /c "`"$VenvPython`" -u `"$KoboldLauncher`" --nomodel --usecuda normal 0 mmq --ttsmodel `"$KokoroModel`" $ExtraArgs --port 13308 --skiplauncher 2>&1" > $logFile
+# --usecuda normal 0 nommq picks the koboldcpp_hipblas.dll we built
+# (koboldcpp.py refuses to load it without --usecuda or --usevulkan).
+# --skiplauncher skips the GUI, --nomodel keeps the LLM side offline,
+# --port 13308 is our convention. No --ttsgpu — Kokoro is CPU-only.
+cmd.exe /c "`"$VenvPython`" -u `"$KoboldLauncher`" --nomodel --usecuda normal 0 nommq --ttsmodel `"$KokoroModel`" --port 13308 --skiplauncher 2>&1" > $logFile

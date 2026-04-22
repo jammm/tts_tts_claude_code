@@ -55,6 +55,19 @@ if (-not $env:GGML_CUDA_FORCE_MMQ) {
     $env:GGML_CUDA_FORCE_MMQ = "1"
 }
 
+# kokoro-hip-server installs SIGABRT / SIGSEGV / std::terminate / SEH
+# handlers that write a crash record (voice, last text, hex dump) and
+# a minidump before the CRT fast-fails. Without these env vars the
+# logs land in the shim's working directory, which is inconvenient to
+# chase down. They are pre-set so users can override by exporting
+# their own value before start_services.ps1.
+if (-not $env:KOKORO_HIP_CRASH_LOG) {
+    $env:KOKORO_HIP_CRASH_LOG = Join-Path $VoicePluginData "logs\kokoro-hip-crash.log"
+}
+if (-not $env:KOKORO_HIP_CRASH_DUMP_DIR) {
+    $env:KOKORO_HIP_CRASH_DUMP_DIR = Join-Path $VoicePluginData "logs"
+}
+
 # Whisper backend selection. Lemonade's whispercpp recipe supports
 # cpu / vulkan / npu / rocm. "rocm" is our lemondate build (whisper-
 # server.exe built from src/whisper + src/ggml in lemondate). The

@@ -179,6 +179,12 @@ def speak(msg: str) -> None:
         timeout=120,
     )
     r.raise_for_status()
+    # Skip audio playback (and the associated 1-2s sounddevice init +
+    # blocking sd.wait) when driving speak.py in a stress loop. The TTS
+    # request itself is the important bit; playback tests sounddevice,
+    # not kokoro-hip-server.
+    if os.environ.get("SPEAK_NO_PLAYBACK"):
+        return
     data, sr = sf.read(io.BytesIO(r.content))
     with tts_lock():
         sd.play(data, sr)

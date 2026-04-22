@@ -139,6 +139,42 @@ claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
 
 The Stop hook is also merged into `~/.claude/settings.json` by the installer, so it fires without `--plugin-dir` too.
 
+## Deploying on Strix Halo (gfx1150 iGPU + XDNA2 NPU)
+
+The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The actual target is Strix Halo — Ryzen AI Max+ 395 / Radeon 8060S (gfx1150 iGPU) + 50-TOPS XDNA2 NPU. Three differences matter for deployment:
+
+1. **PyTorch / ROCm SDK index URL** — TheRock publishes per-arch nightly wheel indices. Swap `gfx120X-all` for `gfx1151` in step 3:
+   ```powershell
+   pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch "rocm[libraries,devel]"
+   rocm-sdk init
+   ```
+   (`gfx1151` is the Lemonade-canonical name for Strix Halo's iGPU; the toolchain ships `gfx1150` cubins under that umbrella because RDNA 3.5 has both ASIC IDs in flight depending on SKU.)
+
+2. **whisper.cpp + koboldcpp HIP builds** — both build scripts now honor `GFX_TARGET`. Set it once and rebuild:
+   ```powershell
+   $env:GFX_TARGET = "gfx1150"          # or "gfx1150;gfx1201" for fat binary
+   .\tools\build_whisper_hip.cmd clean
+   .\tools\build_koboldcpp_hip.cmd clean
+   ```
+
+3. **Whisper on the NPU instead of the iGPU** — Lemonade has a first-class `npu` whispercpp backend (`deps/lemonade/src/cpp/server/backends/whisper_server.cpp`) that auto-downloads its own NPU-compiled `whisper-server.exe` from `lemonade-sdk/whisper.cpp-builds` plus the model's vitisai-compiled `.rai` cache from `amd/whisper-large-v3-onnx-npu` (or `-large-turbo-`, `-medium-`, etc.). All you have to do is set the backend env var before launching services:
+   ```powershell
+   # Prereq: AMD Ryzen AI driver installed (NPU/XDNA driver — get the
+   # latest "AMD Ryzen AI Software" installer; check Device Manager
+   # afterwards for "AMD IPU Device" or "Neural Processors").
+   $env:LEMONADE_WHISPER_BACKEND = "npu"
+   .\installers\stop_services.ps1; .\installers\start_services.ps1
+   ```
+   `installers\run_lemonade.ps1.tmpl` reads `LEMONADE_WHISPER_BACKEND` and translates to Lemonade's internal `LEMONADE_WHISPERCPP=npu`. The NPU encoder is plenty fast for both `Whisper-Large-v3` and `Whisper-Large-v3-Turbo` (Lemonade's `server_models.json` includes a precompiled `.rai` for either). The decode side stays on CPU — that's how upstream's NPU whisper works.
+
+Other defaults stay the same:
+
+- **Kokoro TTS**: same CPU-via-Lemonade path on Strix Halo, just runs on Zen 5 cores instead of Zen 5 Threadripper cores. Median latency stays in the same ballpark (~1 s).
+- **F5-TTS** (`VOICE_TTS=f5`): runs on the iGPU through the gfx1151 PyTorch wheels. Should work the same; haven't actually benchmarked on Strix Halo silicon.
+- **PTT daemon, hooks, plugin**: pure Python, no platform-specific bits.
+
+If Strix Halo doesn't even need ROCm whisper (the NPU is fast enough), you can skip building `vendor\whisper-cpp-rocm\whisper-server.exe` entirely — `run_lemonade.ps1` falls through to the CPU backend if no ROCm whisper binary is present and `LEMONADE_WHISPER_BACKEND` isn't set, and to NPU when it is.
+
 ## Running the services
 
 ```powershell

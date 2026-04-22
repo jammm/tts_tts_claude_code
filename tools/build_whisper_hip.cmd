@@ -1,11 +1,19 @@
 @echo off
-REM Build whisper.cpp with HIP on Windows targeting gfx1201 (Navi 48 / RX 9070 XT).
+REM Build whisper.cpp with HIP on Windows. Default target is gfx1201
+REM (Navi 48 / RX 9070 XT), override with GFX_TARGET to retarget — e.g.
+REM `set GFX_TARGET=gfx1150 && tools\build_whisper_hip.cmd clean` for a
+REM Strix Halo deployment build (RDNA 3.5 iGPU). Multiple targets are
+REM allowed as a semicolon-separated list (CMake convention), e.g.
+REM `set GFX_TARGET=gfx1150;gfx1201` for a fat binary covering both
+REM Strix Halo and discrete RDNA 4.
+REM
 REM Runs inside a VS 2022 x64 developer environment + TheRock ROCm toolchain.
 REM
 REM Inputs:
 REM   WHISPER_SRC     default d:\jam\whisper.cpp
 REM   WHISPER_BUILD   default %WHISPER_SRC%\build-rocm
 REM   VENV_ROOT       default d:\jam\demos\.venv        (must contain rocm-sdk-devel)
+REM   GFX_TARGET      default gfx1201                   (any HIP arch)
 
 setlocal enabledelayedexpansion
 
@@ -14,6 +22,7 @@ if not defined LLAMA_SRC     set "LLAMA_SRC=%~dp0..\deps\llama.cpp"
 if not defined WHISPER_BUILD set "WHISPER_BUILD=%WHISPER_SRC%\build-rocm"
 if not defined VENV_ROOT     set "VENV_ROOT=%~dp0..\.venv"
 if not defined STAGE_DIR     set "STAGE_DIR=%~dp0..\vendor\whisper-cpp-rocm"
+if not defined GFX_TARGET    set "GFX_TARGET=gfx1201"
 
 REM --- 1. Load VS 2022 x64 environment -------------------------------------
 set "VS_VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -64,7 +73,7 @@ if exist "%LLAMA_SRC%\ggml" (
 )
 
 REM --- 4. Configure ---------------------------------------------------------
-echo [build] configuring at %WHISPER_BUILD%
+echo [build] configuring at %WHISPER_BUILD% for GFX_TARGET=%GFX_TARGET%
 cmake -S "%WHISPER_SRC%" -B "%WHISPER_BUILD%" -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_C_COMPILER="%ROCM_ROOT%\lib\llvm\bin\amdclang-cl.exe" ^
@@ -72,9 +81,9 @@ cmake -S "%WHISPER_SRC%" -B "%WHISPER_BUILD%" -G Ninja ^
   -DCMAKE_PREFIX_PATH="%ROCM_ROOT%\lib\cmake;%ROCM_ROOT%" ^
   -DGGML_HIP=ON ^
   -DGGML_HIP_ROCWMMA_FATTN=OFF ^
-  -DAMDGPU_TARGETS=gfx1201 ^
-  -DGPU_TARGETS=gfx1201 ^
-  -DCMAKE_HIP_ARCHITECTURES=gfx1201 ^
+  -DAMDGPU_TARGETS=%GFX_TARGET% ^
+  -DGPU_TARGETS=%GFX_TARGET% ^
+  -DCMAKE_HIP_ARCHITECTURES=%GFX_TARGET% ^
   -DWHISPER_BUILD_EXAMPLES=ON ^
   -DWHISPER_BUILD_SERVER=ON ^
   -DWHISPER_BUILD_TESTS=OFF

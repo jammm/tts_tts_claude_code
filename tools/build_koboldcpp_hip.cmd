@@ -1,15 +1,23 @@
 @echo off
-REM Build koboldcpp with HIP/HIPBLAS on Windows targeting gfx1201
-REM (Navi 48 / RX 9070 XT). koboldcpp is a llama.cpp fork with TTS/STT
-REM support including Kokoro, Qwen3TTS, OuteTTS, Parler, Dia, Whisper.
-REM Output: koboldcpp_hipblas.dll plus the koboldcpp.py launcher staged
-REM into vendor/koboldcpp-rocm/.
+REM Build koboldcpp with HIP/HIPBLAS on Windows. Default target is
+REM gfx1201 (Navi 48 / RX 9070 XT), override with GFX_TARGET — e.g.
+REM `set GFX_TARGET=gfx1150 && tools\build_koboldcpp_hip.cmd clean` for
+REM a Strix Halo deployment build (RDNA 3.5 iGPU). Multiple targets
+REM are allowed as a semicolon-separated list (CMake convention), e.g.
+REM `set GFX_TARGET=gfx1150;gfx1201` for a fat binary covering both
+REM Strix Halo and discrete RDNA 4.
+REM
+REM koboldcpp is a llama.cpp fork with TTS/STT support including Kokoro,
+REM Qwen3TTS, OuteTTS, Parler, Dia, Whisper. Output: koboldcpp_hipblas
+REM .dll plus the koboldcpp.py launcher staged into
+REM vendor/koboldcpp-rocm/.
 REM
 REM Inputs:
 REM   KOBOLD_SRC      default %~dp0..\deps\koboldcpp
 REM   KOBOLD_BUILD    default %KOBOLD_SRC%\build-rocm
 REM   VENV_ROOT       default %~dp0..\.venv  (must contain rocm-sdk-devel)
 REM   STAGE_DIR       default %~dp0..\vendor\koboldcpp-rocm
+REM   GFX_TARGET      default gfx1201        (any HIP arch)
 
 setlocal enabledelayedexpansion
 
@@ -17,6 +25,7 @@ if not defined KOBOLD_SRC   set "KOBOLD_SRC=%~dp0..\deps\koboldcpp"
 if not defined KOBOLD_BUILD set "KOBOLD_BUILD=%KOBOLD_SRC%\build-rocm"
 if not defined VENV_ROOT    set "VENV_ROOT=%~dp0..\.venv"
 if not defined STAGE_DIR    set "STAGE_DIR=%~dp0..\vendor\koboldcpp-rocm"
+if not defined GFX_TARGET   set "GFX_TARGET=gfx1201"
 
 REM --- 1. Load VS 2022 x64 environment -------------------------------------
 set "VS_VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -55,7 +64,7 @@ REM koboldcpp's HIP build uses `-xhip` + CMake LANGUAGE CXX on .cu files
 REM which confuses clang-cl into naming intermediate offload-bundler
 REM inputs '*.exe' (MSVC-style exe naming) instead of '*.o'. The GNU
 REM driver produces the expected '*.o' and the HIP toolchain is happy.
-echo [build] configuring at %KOBOLD_BUILD%
+echo [build] configuring at %KOBOLD_BUILD% for GFX_TARGET=%GFX_TARGET%
 REM BUILD_SHARED_LIBS omitted on purpose: koboldcpp's CMake links targets
 REM like common2 -> ggml but NOT common2 -> llama-impl, relying on the
 REM final koboldcpp_hipblas.dll link step to pull all unresolved symbols
@@ -70,9 +79,9 @@ cmake -S "%KOBOLD_SRC%" -B "%KOBOLD_BUILD%" -G Ninja ^
   -DCMAKE_CXX_COMPILER="%ROCM_ROOT%\lib\llvm\bin\clang++.exe" ^
   -DCMAKE_PREFIX_PATH="%ROCM_ROOT%\lib\cmake;%ROCM_ROOT%" ^
   -DLLAMA_HIPBLAS=ON ^
-  -DAMDGPU_TARGETS=gfx1201 ^
-  -DGPU_TARGETS=gfx1201 ^
-  -DCMAKE_HIP_ARCHITECTURES=gfx1201
+  -DAMDGPU_TARGETS=%GFX_TARGET% ^
+  -DGPU_TARGETS=%GFX_TARGET% ^
+  -DCMAKE_HIP_ARCHITECTURES=%GFX_TARGET%
 if errorlevel 1 (
     echo [build] configure failed
     exit /b 1

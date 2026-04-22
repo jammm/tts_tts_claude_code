@@ -38,6 +38,9 @@ pretrained_models/
 # Logs
 *.log
 
+# Local stress-test / monitor output (scripts/*_stress.ps1 / watch_crash.ps1)
+scripts/*.out
+
 # OS cruft
 Thumbs.db
 .DS_Store

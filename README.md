@@ -2,9 +2,11 @@
 
 Local STT, wake word, and TTS for [Claude Code](https://docs.claude.com/en/docs/claude-code) on Windows 11. Everything runs on your own machine — no cloud.
 
-- **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp. On a 9070 XT (gfx1201) with Whisper-Large-v3-Turbo, transcribes 37.8 s of speech in ~460 ms steady-state — 80× realtime. Requires a patched Lemonade (our `jam/windows-rocm-whisper` submodule branch) because upstream Lemonade only wires CPU / NPU / Vulkan for whispercpp.
+This repo holds the **Claude Code plugin + installer** only. The heavy lifting (lemond server, ROCm whisper, HIP Kokoro, ttscpp, the ggml tree, the PTT daemon sources, the Python venv) lives in a separate **[`jammm/lemondate`](https://github.com/jammm/lemondate)** repo that you build once. This installer then renders shims pointing at that build.
+
+- **STT (hold-F9 or wake-word) on the GPU** via lemondate's ROCm build of whisper.cpp (`bin/whisper-server.exe`). On a 9070 XT (gfx1201) with Whisper-Large-v3-Turbo, transcribes 37.8 s of speech in ~460 ms steady-state — 80× realtime. lemond (lemondate's patched Lemonade C++ server on the `jam/windows-rocm-whisper` branch) is required because upstream Lemonade only wires CPU / NPU / Vulkan for whispercpp.
 - **Wake word ("hey halo" by default)** — no custom keyword-spotter. Every energy-gated speech burst gets transcribed by Whisper; the transcript is typed only if it starts with the configured wake phrase. Changing the wake phrase is a single env var.
-- **TTS on the GPU** via our patched koboldcpp HIP build running Kokoro through ttscpp. Pinned to `jammm/koboldcpp jam/gfx1201-hip` with four upstream bug-fixes (128-byte tensor alignment, `reciprocal()` host-pointer hack, direct-`->data` writes in `set_inputs`, shared HIP stream) plus a fused `snake_1d` megakernel and CUDA implementations for the kcpp ttscpp dirtypatch ops. On a 9070 XT: **0.10 s short prompt, 1.30 s for a 402-char paragraph, median 0.37 s warm** once `ROCBLAS_USE_HIPBLASLT=1` is set (gives ~7× speedup by routing F32 matmul through hipBLASLt's complete gfx1201 kernel set instead of rocBLAS's incomplete one). Opt-out to CPU via `VOICE_TTS=cpu` or to F5-TTS via `VOICE_TTS=f5` — see [Switching TTS backends](#switching-tts-backends).
+- **TTS on the GPU** via lemondate's HIP Kokoro server (`bin/kokoro-hip-server.exe` — ttscpp + our HIP patches: 128-byte tensor alignment, `reciprocal()` rewrite, direct-`->data` writes in `set_inputs` replaced with staging + `ggml_backend_tensor_set`, shared HIP stream, fused `snake_1d` megakernel, CUDA kernels for the kcpp ttscpp dirtypatch ops). On a 9070 XT: **0.10 s short prompt, 1.30 s for a 402-char paragraph, median 0.37 s warm** once `ROCBLAS_USE_HIPBLASLT=1` is set (gives ~7× speedup by routing F32 matmul through hipBLASLt's complete gfx1201 kernel set instead of rocBLAS's incomplete one). Opt-out to CPU via `VOICE_TTS=cpu` or to F5-TTS via `VOICE_TTS=f5` — see [Switching TTS backends](#switching-tts-backends).
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
 - **Focus gated to Claude Code** — F9 and wake only fire when the foreground window hosts a `claude.exe` process (or a terminal that has `claude` running alongside). Transcriptions never accidentally land in the wrong app.
 - **Auto-submit** — the daemon presses Enter after typing the transcription so Claude starts processing the moment you stop talking. Set `PTT_AUTO_SUBMIT=0` to review before sending.
@@ -15,15 +17,15 @@ Based on [`PLAN.md`](PLAN.md), with Windows/ROCm-specific adjustments documented
 
 If you're another Claude agent picking up this codebase, read this whole section before touching anything — the short version of how the pieces fit together:
 
-- **Three things run on localhost**: `lemond.exe` (port 13305, STT + built-in CPU Kokoro fallback), `koboldcpp_hipblas.dll`-backed python process (port 13308, default GPU TTS) and the `ptt_daemon` Python process (no port; F9 + wake word + typing). Lemonade is always required. The kobold TTS service is default; F5 / kokoro / cpu-only are opt-in via `VOICE_TTS`. The PTT daemon is always required.
-- **Code lives in four places:**
-  - `ptt/` — the PTT daemon (wake detection, recording, transcription, typing) and the optional `kokoro_server.py` / `f5_tts_server.py` GPU TTS services.
+- **Two repos.** This one (`jammm/tts_tts_claude_code`) is plugin + installer only. The C++ servers, ttscpp, the ggml tree, the PTT daemon sources, and the ROCm Python venv all live in a sibling repo [`jammm/lemondate`](https://github.com/jammm/lemondate) that you build once. The installer in this repo renders shims pointing into a lemondate install.
+- **One lemond process on localhost** (port 13305) serves STT (`/api/v1/audio/transcriptions`) and TTS (`/api/v1/audio/speech`). lemond spawns `whisper-server.exe` (ROCm GPU STT) and `kokoro-hip-server.exe` (HIP GPU Kokoro TTS) as child processes on demand, based on `LEMONADE_WHISPER_BACKEND` / `LEMONADE_KOKORO_BACKEND` env vars set by the shim. Plus a `ptt_daemon` Python process (no port; F9 + wake word + typing). The PTT daemon is always required.
+- **Code lives in three places now:**
   - `claude-plugin-voice/` — the Claude Code plugin (Stop hook that speaks replies, `/voice:speak` slash command).
-  - `installers/` — PowerShell scripts that deploy code from `ptt/` + `claude-plugin-voice/` into `%LOCALAPPDATA%\voice-plugin\` and `~/.claude/plugins/voice\`, plus `run_*.ps1.tmpl` shims that start the services.
-  - `tools/` + `deps/` + `vendor/` — build scripts and compiled binaries for the ROCm Whisper / Lemonade C++ servers.
-- **The config file is the contract.** `ptt/config.py` is the single source of truth for tunables. If you're adjusting behavior, go through env vars declared in there. Don't hard-code values in other files.
+  - `installers/` — PowerShell scripts that deploy the plugin into `~/.claude/plugins/voice\`, merge the Stop hook into `~/.claude/settings.json`, and render `run_*.ps1.tmpl` shims into `%LOCALAPPDATA%\voice-plugin\shims\` with the lemondate install path baked in.
+  - Everything else — `bin/` (the three C++ binaries), `ptt/` (the Python daemon sources), `venv/` (Python 3.12 + TheRock ROCm torch), `models/` (Kokoro GGUF) — lives in a lemondate build tree at whatever `-LemondatePath` you point the installer at.
+- **The config file is the contract.** `ptt/config.py` (in lemondate) is the single source of truth for tunables. If you're adjusting behavior, go through env vars declared in there. Don't hard-code values in other files.
 - **Do not restart services in the middle of debugging unless necessary.** Services run in the background and log to `%LOCALAPPDATA%\voice-plugin\logs\`. Tail those files before killing anything. The PID file at `%LOCALAPPDATA%\voice-plugin\services.json` tracks which process is which; `stop_services.ps1` expects it.
-- **The repo is a git clone at `d:\jam\demos` and a GitHub remote at `origin`**. Submodules under `deps/` pin specific upstream commits — don't update them casually.
+- **The repo is a git clone at `d:\jam\demos` and a GitHub remote at `origin`**.
 - **`PLAN.md` is the original design doc. Don't edit it.** It's the aspirational starting point; this README is what actually got built.
 - **Don't assume a specific GPU.** The 9070 XT (gfx1201) is the dev machine, but the target test platform is Strix Halo (gfx1151, Radeon 8060S iGPU). Anything that relies on 9070 XT-only ROCm features is a bug.
 
@@ -33,117 +35,82 @@ If you're another Claude agent picking up this codebase, read this whole section
 .
 ├── PLAN.md                       original design doc (historical)
 ├── README.md                     this file
-├── requirements.txt              Python deps (PTT daemon + plugin)
-├── ptt/                          daemon + optional GPU TTS services
-│   ├── config.py                 env-driven knobs (WAKE_PHRASE, etc.)
-│   ├── ptt_daemon.py             entry point: F9 hook + wake listener
-│   ├── whisper_wake_listener.py  energy-VAD + Whisper wake-phrase check
-│   ├── recorder.py               capture -> POST to whisper -> type
-│   ├── window_check.py           focus gate (claude.exe under foreground?)
-│   ├── f5_tts_server.py          opt-in GPU TTS service (port 13307)
-│   └── kokoro_server.py          experimental GPU Kokoro (port 13306)
 ├── claude-plugin-voice/          Claude Code plugin
 │   ├── .claude-plugin/plugin.json
 │   ├── commands/speak.md         /voice:speak slash command
 │   ├── hooks/hooks.json          Stop hook (inline-copied to settings.json)
 │   └── scripts/speak.py          fetches WAV from TTS, plays via sounddevice
-├── installers/
-│   ├── install_windows.ps1       deploys plugin + daemon + merges settings.json
-│   ├── start_services.ps1        launches lemonade + optional TTS + PTT
-│   ├── stop_services.ps1         kills all by pidfile + orphan walk
-│   ├── uninstall_windows.ps1
-│   └── run_{lemonade,kokoro,f5,ptt}.ps1.tmpl   service launch shims
-├── tools/
-│   ├── build_lemonade_cpp.cmd    builds lemond.exe (Lemonade C++ server)
-│   └── build_whisper_hip.cmd     builds whisper-server.exe (ROCm/gfx1201)
-└── deps/                         git submodules
-    ├── lemonade/                 lemonade-sdk/lemonade on our
-    │                             jam/windows-rocm-whisper branch —
-    │                             adds a ROCm backend for whispercpp
-    │                             that upstream doesn't have. See
-    │                             "Build / runtime notes" below.
-    ├── whisper.cpp/              ggml-org/whisper.cpp
-    └── llama.cpp/                ggml-org/llama.cpp (ggml overlay source)
+└── installers/
+    ├── install_windows.ps1       -LemondatePath <path>: deploys plugin + renders shims + merges settings.json
+    ├── start_services.ps1        launches lemond + optional TTS + PTT
+    ├── stop_services.ps1         kills all by pidfile + orphan walk
+    ├── uninstall_windows.ps1
+    └── run_{lemond,kokoro,f5,ptt}.ps1.tmpl   service launch shims (@@LEMONDATE_PATH@@ substituted at install)
 
-# gitignored, generated by bootstrap/build:
-.venv/                            Python 3.12 venv: TheRock ROCm torch, f5-tts, etc.
-vendor/lemonade-cpp/              lemond.exe + resources/
-vendor/whisper-cpp-rocm/          whisper-server.exe + ggml-hip.dll + ROCm DLLs
-%LOCALAPPDATA%/voice-plugin/      installed daemon + run_*.ps1 shims + logs/
-~/.claude/plugins/voice/          installed Claude Code plugin
-~/.claude/settings.json           merged by install_windows.ps1 (hook + allowlist)
+# lemondate build tree (separate repo) - installer points here:
+<LemondatePath>/bin/lemond.exe                     Lemonade C++ server (port 13305)
+<LemondatePath>/bin/whisper-server.exe             ROCm GPU STT (spawned by lemond)
+<LemondatePath>/bin/kokoro-hip-server.exe          HIP GPU Kokoro TTS (spawned by lemond)
+<LemondatePath>/ptt/ptt_daemon.py                  F9 + wake word + typer
+<LemondatePath>/ptt/{recorder,whisper_wake_listener,window_check,config}.py
+<LemondatePath>/ptt/{f5_tts_server,kokoro_server}.py  legacy Python GPU TTS A/B paths
+<LemondatePath>/venv/Scripts/python.exe            Python 3.12 + TheRock ROCm torch
+<LemondatePath>/models/Kokoro_no_espeak_Q4.gguf    HIP Kokoro weights (optional)
+
+# Generated by the installer:
+%LOCALAPPDATA%/voice-plugin/shims/run_*.ps1        rendered shims with lemondate paths baked in
+%LOCALAPPDATA%/voice-plugin/logs/                  service logs (lemond-*.log, ptt-*.log, etc.)
+%LOCALAPPDATA%/voice-plugin/services.json          pidfile for stop_services.ps1
+~/.claude/plugins/voice/                           installed Claude Code plugin
+~/.claude/settings.json                            merged by install_windows.ps1 (hook + allowlist)
 ```
 
 ### Services and ports
 
-| service       | port  | what it serves                                      | backend                                                |
-|---------------|------:|-----------------------------------------------------|--------------------------------------------------------|
-| `lemond`      | 13305 | `/api/v1/audio/transcriptions` + `/audio/speech`    | ROCm whisper.cpp (our build) + CPU Kokoro TTS          |
-| `f5_tts`      | 13307 | `/api/v1/audio/speech` (opt-in)                     | F5-TTS (DiT + Vocos) in pure eager PyTorch on ROCm     |
-| `kokoro_server` | 13306 | `/api/v1/audio/speech` (experimental)              | hexgrad/Kokoro-82M with `torch.compile(backend=eager)` |
-| `ptt_daemon`  | —     | F9 hotkey + Whisper-wake + recorder + typer         | pynput + sounddevice + HTTP to lemond                   |
+| service                  | port  | what it serves                                      | backend                                                |
+|--------------------------|------:|-----------------------------------------------------|--------------------------------------------------------|
+| `lemond`                 | 13305 | `/api/v1/audio/transcriptions` + `/audio/speech`    | ROCm whisper-server + HIP kokoro-hip-server (spawned)  |
+| `f5_tts_server.py`       | 13307 | `/api/v1/audio/speech` (opt-in)                     | F5-TTS (DiT + Vocos) in pure eager PyTorch on ROCm     |
+| `kokoro_server.py`       | 13306 | `/api/v1/audio/speech` (experimental)               | hexgrad/Kokoro-82M with `torch.compile(backend=eager)` |
+| `ptt_daemon`             | —     | F9 hotkey + Whisper-wake + recorder + typer         | pynput + sounddevice + HTTP to lemond                  |
 
-Default runtime is `lemond` (STT on ROCm GPU + fallback CPU Kokoro) + `koboldcpp_hipblas` (GPU Kokoro) + `ptt_daemon`. F5 and the experimental PyTorch Kokoro GPU service are opt-in via `VOICE_TTS=f5` or `VOICE_TTS=kokoro`.
+Default runtime is `lemond` (one process; internally ROCm GPU STT + HIP GPU Kokoro via spawned helpers) + `ptt_daemon`. F5 and the experimental PyTorch Kokoro GPU service are opt-in via `VOICE_TTS=f5` or `VOICE_TTS=kokoro`.
 
 ## Prerequisites
 
 - Windows 11, AMD Radeon RX 9000-series or Ryzen AI Max+ / Strix Halo (gfx120X / gfx1151)
-- Python 3.12 on `PATH` as `py -3.12`
-- Visual Studio 2022 Community (Desktop C++ workload) — needed to build `lemond.exe`, `whisper-server.exe`, and `koboldcpp_hipblas.dll`
-- CMake 3.28+
-- Git
+- PowerShell 7+ (the installer requires it)
 - Claude Code CLI (`claude`)
+- A completed lemondate build (see [jammm/lemondate](https://github.com/jammm/lemondate) for prerequisites on that side — Python 3.12, VS 2022 Desktop C++, CMake 3.28+, Git, TheRock ROCm SDK wheel). Lemondate's build provisions its own venv and compiles the three C++ binaries.
 
-## Bootstrap on a fresh clone
+## Quickstart
 
-```powershell
-# 1. Source + submodules
-git clone https://github.com/jammm/tts_tts_claude_code.git
-cd tts_tts_claude_code
-git submodule update --init --recursive
+1. **Build lemondate.** See [jammm/lemondate](https://github.com/jammm/lemondate) for details; on Windows:
+   ```powershell
+   git clone https://github.com/jammm/lemondate.git d:\jam\lemondate
+   cd d:\jam\lemondate
+   # Create venv, install TheRock ROCm SDK + torch (only needed for PTT daemon):
+   .\ptt\install.ps1                     # or -GfxIndex gfx1151 on Strix Halo
+   # Build the three C++ binaries (~10-15 min on a warm box):
+   .\build.cmd                           # or $env:GFX_TARGET="gfx1151"; .\build.cmd
+   # Download Kokoro weights:
+   New-Item -Force -ItemType Directory models | Out-Null
+   curl.exe -L -o models\Kokoro_no_espeak_Q4.gguf `
+     https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf
+   ```
 
-# 2. Python venv + base deps
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install --upgrade pip
-pip install -r requirements.txt
+2. **Install this plugin on top.** Point the installer at your lemondate build:
+   ```powershell
+   cd d:\jam\demos
+   .\installers\install_windows.ps1 -LemondatePath d:\jam\lemondate
+   ```
+   This installs the Claude plugin, merges the Stop hook into `~/.claude/settings.json`, and renders the shim templates (`run_lemond`, `run_ptt`, `run_f5`, `run_kokoro`) pointing at your lemondate install.
 
-# 3. TheRock ROCm PyTorch (torch + HIP SDK for gfx120X / gfx1151).
-# For Strix Halo, swap "gfx120X-all" for "gfx1151" in the index URL.
-pip install --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch "rocm[libraries,devel]"
-rocm-sdk init        # extracts the ROCm runtime into the venv (~1.3 GB)
-
-# 4. Build the three C++ binaries (~15-20 min total on a warm box).
-# The default TTS backend is GPU Kokoro via koboldcpp, so all three
-# are required for a first-time install.
-.\tools\build_lemonade_cpp.cmd        # ~3 min    -> vendor\lemonade-cpp\lemond.exe
-.\tools\build_whisper_hip.cmd         # ~2 min    -> vendor\whisper-cpp-rocm\whisper-server.exe (ROCm GPU STT)
-.\tools\build_koboldcpp_hip.cmd       # ~10-15 min -> vendor\koboldcpp-rocm\koboldcpp_hipblas.dll (HIP GPU TTS)
-# (Override gfx target with $env:GFX_TARGET="gfx1151" for Strix Halo
-# before running the HIP builds — see Deploying on Strix Halo below.)
-
-# 5. Download the Kokoro GGUF weights koboldcpp will serve
-New-Item -ItemType Directory -Force models | Out-Null
-curl.exe -L -o models\Kokoro_no_espeak_Q4.gguf `
-  https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf
-
-# 6. Pull the Whisper STT model into Lemonade's cache
-.\vendor\lemonade-cpp\lemond.exe          # leave running in this shell
-.\vendor\lemonade-cpp\lemonade.exe pull Whisper-Large-v3-Turbo
-# (Whisper-Small works too if you want ~3x faster but noticeably less
-# accurate STT. Override with WHISPER_MODEL env var.)
-# Ctrl-C the lemond above — start_services.ps1 launches it properly later.
-
-# 7. Deploy plugin + daemon + settings.json hook
-.\installers\install_windows.ps1
-
-# 8. Launch services
-.\installers\start_services.ps1
-```
-
-After step 8 you have `lemond` (STT on ROCm GPU) + `koboldcpp_hipblas` (TTS on HIP GPU) + `ptt_daemon` running. F9 push-to-talk and "hey halo" wake-word are both armed.
-
-If you're resurrecting an existing install and just want to move from the old CPU-TTS default to the new GPU-TTS default: run steps 4b (`build_koboldcpp_hip.cmd`), 5 (download GGUF), 7 (`install_windows.ps1` to re-render the shim), then `.\installers\stop_services.ps1; .\installers\start_services.ps1`.
+3. **Launch the services.**
+   ```powershell
+   .\installers\start_services.ps1
+   ```
+   F9 push-to-talk and "hey halo" wake word arm automatically. lemond spawns `whisper-server.exe` (ROCm GPU STT) + `kokoro-hip-server.exe` (HIP Kokoro TTS) on demand.
 
 ```powershell
 claude --plugin-dir "$env:USERPROFILE\.claude\plugins\voice"
@@ -153,23 +120,23 @@ The Stop hook is also merged into `~/.claude/settings.json` by the installer, so
 
 ## Deploying on Strix Halo (gfx1151 iGPU + XDNA2 NPU)
 
-The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The actual target is Strix Halo — Ryzen AI Max+ 395 / Radeon 8060S (gfx1151 iGPU) + 50-TOPS XDNA2 NPU. Three differences matter for deployment:
+The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The actual target is Strix Halo — Ryzen AI Max+ 395 / Radeon 8060S (gfx1151 iGPU) + 50-TOPS XDNA2 NPU. Three differences matter for deployment; all are configured in the lemondate build, not here:
 
-1. **PyTorch / ROCm SDK index URL** — TheRock publishes per-arch nightly wheel indices. Swap `gfx120X-all` for `gfx1151` in step 3:
+1. **PyTorch / ROCm SDK index URL** — TheRock publishes per-arch nightly wheel indices. Pass the target arch to lemondate's PTT venv installer:
    ```powershell
-   pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch "rocm[libraries,devel]"
-   rocm-sdk init
+   cd d:\jam\lemondate
+   .\ptt\install.ps1 -GfxIndex gfx1151
    ```
    (`gfx1151` is Strix Halo's Radeon 8060S iGPU — not to be confused with `gfx1150`, which is Strix Point's Radeon 880M/890M.)
 
-2. **whisper.cpp + koboldcpp HIP builds** — both build scripts now honor `GFX_TARGET`. Set it once and rebuild:
+2. **C++ binaries for gfx1151** — lemondate's `build.cmd` honors `GFX_TARGET`. Set it once and rebuild:
    ```powershell
    $env:GFX_TARGET = "gfx1151"          # or "gfx1151;gfx1201" for fat binary
-   .\tools\build_whisper_hip.cmd clean
-   .\tools\build_koboldcpp_hip.cmd clean
+   .\build.cmd
    ```
+   This produces `bin\whisper-server.exe` and `bin\kokoro-hip-server.exe` targeting gfx1151. `lemond.exe` itself is arch-independent.
 
-3. **Whisper on the NPU instead of the iGPU** — Lemonade has a first-class `npu` whispercpp backend (`deps/lemonade/src/cpp/server/backends/whisper_server.cpp`) that auto-downloads its own NPU-compiled `whisper-server.exe` from `lemonade-sdk/whisper.cpp-builds` plus the model's vitisai-compiled `.rai` cache from `amd/whisper-large-v3-onnx-npu` (or `-large-turbo-`, `-medium-`, etc.). All you have to do is set the backend env var before launching services:
+3. **Whisper on the NPU instead of the iGPU** — Lemonade has a first-class `npu` whispercpp backend that auto-downloads its own NPU-compiled `whisper-server.exe` from `lemonade-sdk/whisper.cpp-builds` plus the model's vitisai-compiled `.rai` cache from `amd/whisper-large-v3-onnx-npu` (or `-large-turbo-`, `-medium-`, etc.). All you have to do is set the backend env var before launching services:
    ```powershell
    # Prereq: AMD Ryzen AI driver installed (NPU/XDNA driver — get the
    # latest "AMD Ryzen AI Software" installer; check Device Manager
@@ -177,15 +144,15 @@ The dev machine is a Threadripper PRO 9995WX + RX 9070 XT (gfx1201, no NPU). The
    $env:LEMONADE_WHISPER_BACKEND = "npu"
    .\installers\stop_services.ps1; .\installers\start_services.ps1
    ```
-   `installers\run_lemonade.ps1.tmpl` reads `LEMONADE_WHISPER_BACKEND` and translates to Lemonade's internal `LEMONADE_WHISPERCPP=npu`. The NPU encoder is plenty fast for both `Whisper-Large-v3` and `Whisper-Large-v3-Turbo` (Lemonade's `server_models.json` includes a precompiled `.rai` for either). The decode side stays on CPU — that's how upstream's NPU whisper works.
+   `installers\run_lemond.ps1.tmpl` reads `LEMONADE_WHISPER_BACKEND` and translates to lemond's internal `LEMONADE_WHISPERCPP=npu`. The NPU encoder is plenty fast for both `Whisper-Large-v3` and `Whisper-Large-v3-Turbo` (Lemonade's `server_models.json` includes a precompiled `.rai` for either). The decode side stays on CPU — that's how upstream's NPU whisper works.
 
 Other defaults stay the same:
 
-- **Kokoro TTS**: same CPU-via-Lemonade path on Strix Halo, just runs on Zen 5 cores instead of Zen 5 Threadripper cores. Median latency stays in the same ballpark (~1 s).
+- **HIP Kokoro TTS**: same `kokoro-hip-server.exe` path on Strix Halo, rebuilt for gfx1151 via `$env:GFX_TARGET="gfx1151"` in lemondate. Median latency should stay in the same ballpark once hipBLASLt's gfx1151 Tensile libraries kick in (`ROCBLAS_USE_HIPBLASLT=1` is already set by `run_lemond.ps1`).
 - **F5-TTS** (`VOICE_TTS=f5`): runs on the iGPU through the gfx1151 PyTorch wheels. Should work the same; haven't actually benchmarked on Strix Halo silicon.
 - **PTT daemon, hooks, plugin**: pure Python, no platform-specific bits.
 
-If Strix Halo doesn't even need ROCm whisper (the NPU is fast enough), you can skip building `vendor\whisper-cpp-rocm\whisper-server.exe` entirely — `run_lemonade.ps1` falls through to the CPU backend if no ROCm whisper binary is present and `LEMONADE_WHISPER_BACKEND` isn't set, and to NPU when it is.
+If Strix Halo doesn't even need ROCm whisper (the NPU is fast enough), you can skip building `whisper-server.exe` entirely — `run_lemond.ps1` falls through to the CPU backend if no ROCm whisper binary is present and `LEMONADE_WHISPER_BACKEND` isn't set, and to NPU when it is.
 
 ## Running the services
 
@@ -201,19 +168,23 @@ If Strix Halo doesn't even need ROCm whisper (the NPU is fast enough), you can s
 ### Switching TTS backends
 
 ```powershell
-# Default when vendor\koboldcpp-rocm\koboldcpp_hipblas.dll is built:
-# koboldcpp HIP Kokoro on :13308 (runs Kokoro on the GPU — see
-# "Kokoro on the GPU (HIP)" below for what that entails).
+# Default when lemondate's bin\kokoro-hip-server.exe is present:
+# lemond spawns kokoro-hip-server on demand and serves TTS at
+# :13305/v1/audio/speech (runs Kokoro on the GPU — see "Kokoro on
+# the GPU (HIP)" below for what that entails).
+.\installers\stop_services.ps1; .\installers\start_services.ps1
+
+# Explicit "hip" (identical to the default above, spelled out):
+$env:VOICE_TTS = "hip"
 .\installers\stop_services.ps1; .\installers\start_services.ps1
 
 # CPU opt-out (useful when the GPU is busy training or you want to
-# A/B latency on the same DLL):
-$env:VOICE_TTS = "cpu"      # Lemonade's built-in Kokoro on :13305
+# A/B latency on the same lemond process):
+$env:VOICE_TTS = "cpu"      # lemond's built-in Kokoro on :13305
 .\installers\stop_services.ps1; .\installers\start_services.ps1
 
-# F5-TTS on GPU (pure-eager DiT, 300-900 ms/sentence, needs
-# tools\build_koboldcpp_hip.cmd to have been run since F5 uses the
-# same TheRock ROCm wheels):
+# F5-TTS on GPU (pure-eager DiT, 300-900 ms/sentence — uses
+# lemondate's venv + torch built against TheRock ROCm):
 $env:VOICE_TTS = "f5"
 .\installers\stop_services.ps1; .\installers\start_services.ps1
 
@@ -221,14 +192,9 @@ $env:VOICE_TTS = "f5"
 # recompile cliffs; mostly kept for reference):
 $env:VOICE_TTS = "kokoro"
 .\installers\stop_services.ps1; .\installers\start_services.ps1
-
-# Inside the "kobold" backend you can force ttscpp to CPU (A/B
-# without rebuilding the DLL — useful because the services.json
-# still records tts_backend=kobold so speak.py keeps routing to
-# :13308 regardless):
-$env:VOICE_TTS_KOBOLD_CPU = "1"
-.\installers\stop_services.ps1; .\installers\start_services.ps1
 ```
+
+`VOICE_TTS=kobold` is accepted as a legacy alias for `hip` — the underlying binary is no longer koboldcpp (it's a tiny `kokoro-hip-server.exe` built from the same ttscpp code inside lemondate), but the configuration knob stayed.
 
 `speak.py` auto-picks the right `TTS_URL` / `TTS_SPEECH_PATH` in this order:
 
@@ -240,19 +206,21 @@ $env:VOICE_TTS_KOBOLD_CPU = "1"
 
 Backend → port mapping used internally:
 
-| VOICE_TTS | Server                  | URL                                            |
-|-----------|-------------------------|------------------------------------------------|
-| `kobold`  | koboldcpp HIP Kokoro    | `http://127.0.0.1:13308/v1/audio/speech`       |
-| `cpu`     | Lemonade CPU Kokoro     | `http://127.0.0.1:13305/api/v1/audio/speech`   |
-| `f5`      | F5-TTS on GPU           | `http://127.0.0.1:13307/api/v1/audio/speech`   |
-| `kokoro`  | ROCm PyTorch Kokoro     | `http://127.0.0.1:13306/api/v1/audio/speech`   |
+| VOICE_TTS     | Server                                      | URL                                            |
+|---------------|---------------------------------------------|------------------------------------------------|
+| `hip`         | lemond → kokoro-hip-server (HIP Kokoro)     | `http://127.0.0.1:13305/api/v1/audio/speech`   |
+| `cpu`         | lemond built-in Kokoro                      | `http://127.0.0.1:13305/api/v1/audio/speech`   |
+| `f5`          | F5-TTS on GPU                               | `http://127.0.0.1:13307/api/v1/audio/speech`   |
+| `kokoro`      | ROCm PyTorch Kokoro                         | `http://127.0.0.1:13306/api/v1/audio/speech`   |
 
 ### Running the daemon interactively
 
 ```powershell
 .\installers\stop_services.ps1
-.\.venv\Scripts\Activate.ps1
-$env:PYTHONPATH = "."
+# Use lemondate's venv + ptt tree:
+$env:LEMONDATE = "d:\jam\lemondate"
+& "$env:LEMONDATE\venv\Scripts\Activate.ps1"
+$env:PYTHONPATH = $env:LEMONDATE
 python -m ptt.ptt_daemon --verbose
 # F9 + "hey halo" both armed. Ctrl-C to stop.
 # Useful flags: --no-wake, --no-ptt
@@ -261,10 +229,11 @@ python -m ptt.ptt_daemon --verbose
 ### Checking status
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:13305/api/v1/health    # lemonade (STT + CPU TTS)
+Invoke-RestMethod http://127.0.0.1:13305/api/v1/health    # lemond (STT + TTS)
 # If VOICE_TTS=f5:
 Invoke-RestMethod http://127.0.0.1:13307/api/v1/health    # F5-TTS
 # Processes:
+Get-Process lemond, whisper-server, kokoro-hip-server -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='python.exe'" `
     | Where-Object CommandLine -match "ptt_daemon|f5_tts_server|kokoro_server" `
     | Select-Object ProcessId, CommandLine
@@ -273,8 +242,8 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" `
 ### Auto-start at logon (optional)
 
 ```powershell
-.\installers\install_windows.ps1 -RegisterScheduledTasks
-Start-ScheduledTask VoiceLemonade
+.\installers\install_windows.ps1 -LemondatePath d:\jam\lemondate -RegisterScheduledTasks
+Start-ScheduledTask VoiceLemond
 Start-ScheduledTask VoicePTT
 ```
 
@@ -282,7 +251,7 @@ Start-ScheduledTask VoicePTT
 
 ## Key configuration
 
-All tunables are env vars read by `ptt/config.py` (daemon) or the TTS servers. Set them in the shell before `start_services.ps1`.
+All tunables are env vars read by `ptt/config.py` (daemon, inside lemondate) or the TTS servers. Set them in the shell before `start_services.ps1`.
 
 **Wake phrase** — the big one. Default matches "hey halo" plus common Whisper mishearings ("hello", "hallo", "hailo", etc.). Change via `WAKE_PHRASE` (full regex, must match at the start of the transcript):
 
@@ -300,19 +269,20 @@ $env:WHISPER_MODEL = "Whisper-Small"   # faster, less accurate
 $env:WHISPER_MODEL = "Whisper-Medium"  # middle ground
 ```
 
-**Whispercpp backend** (used by `lemond.exe` internally — set in `installers/run_lemonade.ps1.tmpl`):
+**Whispercpp backend** (used by `lemond.exe` internally — set by `installers/run_lemond.ps1.tmpl` from the `LEMONADE_WHISPER_BACKEND` env var; defaults to `rocm` if `<LemondatePath>\bin\whisper-server.exe` is present, else `cpu`). Override via the public env var:
 
 ```powershell
-# defaults baked into the shim:
-$env:LEMONADE_WHISPERCPP          = "rocm"
-$env:LEMONADE_WHISPERCPP_ROCM_BIN = "D:\jam\demos\vendor\whisper-cpp-rocm\whisper-server.exe"
-$env:LEMONADE_WHISPERCPP_ARGS     = "-nfa"   # disables flash-attention (rocWMMA FA is wrong on gfx1201)
-
-# override to switch back to CPU-only STT:
-$env:LEMONADE_WHISPERCPP = "cpu"
+$env:LEMONADE_WHISPER_BACKEND = "rocm"   # our ROCm whisper-server.exe (default if present)
+$env:LEMONADE_WHISPER_BACKEND = "npu"    # XDNA2 NPU (Strix Halo / Strix Point / Hawk Point)
+$env:LEMONADE_WHISPER_BACKEND = "cpu"    # CPU whispercpp
+$env:LEMONADE_WHISPER_BACKEND = "vulkan" # Vulkan whispercpp
 ```
 
-Heads-up: Lemonade caches its resolved config at `%USERPROFILE%\.cache\lemonade\config.json` on first boot and only re-reads env vars if that file doesn't exist. If you change `LEMONADE_WHISPERCPP*` and don't see the change take effect, delete the cached `config.json` and restart.
+The shim bakes the rest for you: `LEMONADE_WHISPERCPP=rocm`, `LEMONADE_WHISPERCPP_ROCM_BIN=<LemondatePath>\bin\whisper-server.exe`, `LEMONADE_WHISPERCPP_ARGS=-nfa` (disables flash-attention; rocWMMA FA is wrong on gfx1201).
+
+**Kokoro backend** (lemond's TTS side): set `LEMONADE_KOKORO_BACKEND` the same way. Defaults to `hip` if `<LemondatePath>\bin\kokoro-hip-server.exe` is present, else `cpu`. The shim also sets `LEMONADE_KOKORO_HIP_BIN` and `LEMONADE_KOKORO_HIP_MODEL` from the lemondate tree.
+
+Heads-up: Lemonade caches its resolved config at `%USERPROFILE%\.cache\lemonade\config.json` on first boot and only re-reads env vars if that file doesn't exist. If you change `LEMONADE_WHISPERCPP*` / `LEMONADE_KOKORO_*` and don't see the change take effect, delete the cached `config.json` and restart.
 
 **STT hints** — the daemon passes `language=en` and a short context prompt ("The user is talking to an AI coding assistant...") to bias Whisper toward technical vocabulary. Override with `WHISPER_LANGUAGE=""` / `WHISPER_PROMPT=""` to disable either.
 
@@ -320,7 +290,7 @@ Heads-up: Lemonade caches its resolved config at `%USERPROFILE%\.cache\lemonade\
 
 **Energy threshold** for wake capture — `EOU_ENERGY_THRESHOLD` (int16 RMS, default 450). Lower = more sensitive.
 
-**F5-TTS** (when `VOICE_TTS=f5`): `F5_NFE=32` (default, 16 and 8 trade quality for speed), `F5_SPEED=1.15`, `F5_TAIL_PAD_MS=180`, `F5_REF_AUDIO`, `F5_REF_TEXT`. See `ptt/f5_tts_server.py` docstring.
+**F5-TTS** (when `VOICE_TTS=f5`): `F5_NFE=32` (default, 16 and 8 trade quality for speed), `F5_SPEED=1.15`, `F5_TAIL_PAD_MS=180`, `F5_REF_AUDIO`, `F5_REF_TEXT`. See `<LemondatePath>/ptt/f5_tts_server.py` docstring.
 
 ## Interactive test checklist
 
@@ -356,54 +326,25 @@ After `start_services.ps1`:
 ## Architecture decisions / trade-offs
 
 - **Whisper-based wake word instead of a keyword-spotter.** The original design used openWakeWord ("hey jarvis"), but that limited us to its 5 pre-trained phrases unless we trained a custom model. Reusing the Whisper STT we already run — transcribe each energy-gated speech burst, regex-match the transcript — lets us change the wake phrase to anything with one env var. Cost: one Whisper call per utterance vs. openWakeWord's per-frame inference, but Whisper only runs when someone's actually speaking, so amortized load is modest.
-- **koboldcpp HIP Kokoro as default TTS.** Runs Kokoro on the GPU through the ttscpp backend in our `jammm/koboldcpp jam/gfx1201-hip` fork (four upstream bugs patched so Kokoro even starts a kernel without crashing, plus a fused `snake_1d` megakernel and CUDA kernels for the kcpp ttscpp dirtypatch ops — see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip)). No python in the hot loop, no `torch.compile` recompile cliffs. Latency varies with GPU — on gfx1201 / RX 9070 XT it's ~0.4 s for short prompts and ~8 s for a 400-char paragraph; on Strix Halo (gfx1151) once the NPU path matures it'll be the same or faster. Fallbacks: `VOICE_TTS=cpu` for Lemonade's built-in Kokoro (always available, lemond ships it), `VOICE_TTS=f5` for F5-TTS's flow-matching DiT on GPU.
-- **F5-TTS over our custom `kokoro_server` as the PyTorch GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py`) for experimentation but isn't default and has torch-compile issues.
+- **HIP Kokoro as default TTS** via lemondate's `kokoro-hip-server.exe` — a small binary built from ttscpp's Kokoro arch with our HIP patches (four upstream bugs fixed so Kokoro even starts a kernel without crashing, plus a fused `snake_1d` megakernel and CUDA kernels for the kcpp ttscpp dirtypatch ops — see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip)). No python in the hot loop, no `torch.compile` recompile cliffs. Latency varies with GPU — on gfx1201 / RX 9070 XT it's ~0.4 s for short prompts and ~1.3 s for a 400-char paragraph; on Strix Halo (gfx1151) the same hipBLASLt switch should do roughly the same thing once TheRock's gfx1151 Tensile library fully lands. Fallbacks: `VOICE_TTS=cpu` for lemond's built-in Kokoro (always available, lemond ships it), `VOICE_TTS=f5` for F5-TTS's flow-matching DiT on GPU.
+- **F5-TTS over our custom `kokoro_server` as the PyTorch GPU TTS.** F5 is pure eager PyTorch — no `torch.compile`, no Dynamo shape guards, so no per-sentence-shape recompile cliffs. Our Kokoro service still exists (`ptt/kokoro_server.py` in lemondate) for experimentation but isn't default and has torch-compile issues.
 - **Focus gate.** F9 and wake only fire when a `claude.exe` process lives under the foreground window (or when a known terminal-hosting process like Windows Terminal is focused and `claude` is running anywhere on the system). The recorder re-checks just before typing to handle focus drift during Whisper's round-trip.
 - **Stop hook lives in `~/.claude/settings.json`, not just `hooks/hooks.json`.** Claude Code's `--plugin-dir` loads plugin commands but not plugin hooks. The installer merges the Stop hook inline so it fires in both `--plugin-dir` and `/plugin install` modes.
-- **Venv at workspace root (`.\.venv`).** The installer bakes the venv Python path into the shims, so the daemon always uses the right interpreter.
-- **Flash attention disabled at runtime.** `whispercpp.args=-nfa` in Lemonade's config — the rocWMMA FA path produces garbled output on gfx1201 today. Non-FA ROCm is still 24× faster than CPU so we live with it.
+- **Venv + daemon sources live in lemondate, not here.** The installer bakes the lemondate path into the shims, so the daemon always uses `<LemondatePath>\venv\Scripts\python.exe` and imports `ptt.*` from `<LemondatePath>\ptt\`. This repo never creates a venv.
+- **Flash attention disabled at runtime.** `whispercpp.args=-nfa` in lemond's config — the rocWMMA FA path produces garbled output on gfx1201 today. Non-FA ROCm is still 24× faster than CPU so we live with it.
 
 ## Build / runtime notes
 
-- **Patched Lemonade fork for ROCm whisper.** The `deps/lemonade` submodule is pinned to our branch (`jam/windows-rocm-whisper`) which adds a `rocm` option to the `whispercpp` backend dispatch. Four surgical edits over upstream: registering the backend in `system_info.cpp`'s recipe table, an accept-`rocm` branch in `whisper_server.cpp` (plus a no-op `get_install_params` case so external binaries short-circuit the github download), two new env-var mappings in `config_file.cpp` (`LEMONADE_WHISPERCPP_ROCM_BIN` + `LEMONADE_WHISPERCPP_VULKAN_BIN`), and `rocm_bin`/`vulkan_bin` defaults in `resources/defaults.json`. If you re-init submodules you'll lose this — keep the branch.
-- **Lemonade config.json is cached on first boot.** Env vars like `LEMONADE_WHISPERCPP_*` are only read into `%USERPROFILE%\.cache\lemonade\config.json` the first time lemond runs. If you later change a shim env var and it doesn't take effect, delete that file and restart.
-- **CMake on Windows 11 misreads `CMAKE_SYSTEM_VERSION` as 6.2** with recent Windows SDKs via `cpp-httplib`. Both our build scripts pass `-DCMAKE_SYSTEM_VERSION="10.0.26100.0"` explicitly.
-- **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`%VENV%\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for both C and CXX to match compiler families. Mixing with hipcc (GNU-driver) trips CMake's same-family check.
-- **ggml overlay** happens automatically on each `build_whisper_hip.cmd` run: it `xcopy`s `deps/llama.cpp/ggml/` onto `deps/whisper.cpp/ggml/`. No submodule files get committed; the overlay is a build-time step.
+- **Patched Lemonade fork for ROCm whisper.** lemondate includes our `jam/windows-rocm-whisper` edits to lemonade: adds a `rocm` option to the `whispercpp` backend dispatch (registered in `system_info.cpp`'s recipe table, accept-`rocm` branch in `whisper_server.cpp` with a no-op `get_install_params` so external binaries short-circuit the github download), two env-var mappings in `config_file.cpp` (`LEMONADE_WHISPERCPP_ROCM_BIN` + `LEMONADE_WHISPERCPP_VULKAN_BIN`), and `rocm_bin`/`vulkan_bin` defaults in `resources/defaults.json`. lemondate extends the same pattern to Kokoro: `KokoroServer::get_install_params` gains a `hip` option and `LEMONADE_KOKORO_HIP_BIN` lets us point at lemondate's own `kokoro-hip-server.exe`.
+- **Lemonade config.json is cached on first boot.** Env vars like `LEMONADE_WHISPERCPP_*` / `LEMONADE_KOKORO_*` are only read into `%USERPROFILE%\.cache\lemonade\config.json` the first time lemond runs. If you later change a shim env var and it doesn't take effect, delete that file and restart.
+- **CMake on Windows 11 misreads `CMAKE_SYSTEM_VERSION` as 6.2** with recent Windows SDKs via `cpp-httplib`. lemondate's `build.cmd` passes `-DCMAKE_SYSTEM_VERSION="10.0.26100.0"` explicitly.
+- **whisper.cpp + amdclang-cl.** Must use amdclang-cl from TheRock (`<LemondatePath>\venv\Lib\site-packages\_rocm_sdk_devel\lib\llvm\bin\amdclang-cl.exe`) for both C and CXX to match compiler families. Mixing with hipcc (GNU-driver) trips CMake's same-family check.
+- **Unified ggml tree in lemondate.** lemondate keeps one `src/ggml/` that both `whisper-server.exe` and `kokoro-hip-server.exe` build against, with our kcpp dirtypatch ops (`GGML_OP_SNAKE_1D`, `MOD`, `CUMSUM_TTS`, `STFT`, `ISTFT`, `upscale_linear`, `conv_transpose_1d_tts`, `reciprocal`, `ttsround`) and CUDA kernels in place. Avoids the old ggml-overlay hack that `tools/build_whisper_hip.cmd` used to do on the fly.
 - **`cudnn`/MIOpen stays on.** MIOpen is the accuracy-preserving path on ROCm; `torch.backends.cudnn.enabled = False` swaps in an `aten::lstm` fallback that's numerically different and produces worse-sounding audio on this stack.
-
-### Building koboldcpp with HIPBLAS (required — default TTS backend)
-
-`deps/koboldcpp` is pinned to `jammm/koboldcpp jam/gfx1201-hip`. This is our fork of `LostRuins/koboldcpp` with the HIPBLAS build working on Windows + the Kokoro-on-GPU patches (see [Kokoro on the GPU (HIP)](#kokoro-on-the-gpu-hip) below for the bug-fix rundown and the fused-op work). We build `koboldcpp_hipblas.dll` for `gfx1201` by default (override with `$env:GFX_TARGET` for other AMD GPUs — `gfx1151` for Strix Halo, `gfx1151;gfx1201` for a fat binary) and stage it at `vendor/koboldcpp-rocm/` alongside `launch_kobold_rocm.py` and koboldcpp's python launcher.
-
-```powershell
-.\tools\build_koboldcpp_hip.cmd          # full build (10-15 minutes)
-.\tools\build_koboldcpp_hip.cmd clean    # force reconfigure + rebuild
-
-# Download the Kokoro GGUF weights (188 MB, Q4-quantised; Q5 / Q8 / F16
-# variants at https://huggingface.co/mmwillet2/Kokoro_GGUF/tree/main)
-New-Item -ItemType Directory -Force models | Out-Null
-curl.exe -L -o models\Kokoro_no_espeak_Q4.gguf `
-    https://huggingface.co/koboldcpp/tts/resolve/main/Kokoro_no_espeak_Q4.gguf
-
-# Re-run the installer so it renders run_kobold.ps1:
-.\installers\install_windows.ps1
-
-# Restart services — kobold is the default now, no VOICE_TTS needed:
-.\installers\stop_services.ps1; .\installers\start_services.ps1
-```
-
-What's patched in `CMakeLists.txt` (in our fork):
-
-- Added `target_include_directories` to the four `ggml-*rocm` HIP targets — upstream only set them on the main `ggml` target, which broke `amdclang-cl` with "ggml.h: file not found" on Windows.
-- Switched the rocm targets from `SHARED` to `OBJECT` libraries absorbed into the parent `ggml`/`ggml_v2`/`ggml_v3` targets. Upstream's SHARED layout creates circular symbol refs (`ggml_v2.c` calls `ggml_v2_cuda_mul_mat` in the .cu sibling and vice versa) that only resolve on Linux static linking. Merging them drops the separate `ggml-v2-legacy-rocm` target (v2 and v2-legacy .cu files coexist in `ggml-v2-rocm` now).
-- Dropped `BUILD_SHARED_LIBS=ON` in the build script. With shared libs every intermediate `common2.dll`, `gpttype_adapter.dll` etc. has to resolve all its symbols at link time, but upstream relies on `gpttype_adapter.cpp` doing `#include "src/llama.cpp"` so `llama_*` symbols live only there. Static intermediates defer resolution until the final `koboldcpp_hipblas.dll` link — which works.
-- `clang++.exe` (GNU driver) instead of `amdclang-cl.exe` (MSVC driver) as the CXX compiler. The clang-cl driver names HIP offload-bundler intermediates `*.exe` (MSVC conventions) and then the bundler can't find them; the GNU driver produces `*.o` like the HIP toolchain expects.
-- Added every `ggml/src/ggml-cuda/template-instances/fattn-vec-instance-*.cu` to `GGML_SOURCES_CUDA`. Upstream only listed a subset explicitly, which worked because their CUDA CMake glob caught the rest; on our HIP-only path the linker failed with "undefined symbol: `ggml_cuda_flash_attn_ext_vec_case<64,1,1>`" etc.
 
 ### Kokoro on the GPU (HIP)
 
-`VOICE_TTS=kobold` is the default. Kokoro runs on the GPU through ttscpp in our submodule (not upstream — ttscpp in `LostRuins/koboldcpp` is hardcoded `cpu_only=true` for all its TTS architectures, and `koboldcpp.py`'s `--ttsgpu` flag's tooltip even calls out "OuteTTS / Q3TTS only"). Getting Kokoro itself onto HIP took four upstream bugs and two optimisations:
+`VOICE_TTS=hip` is the default (legacy `VOICE_TTS=kobold` still works). Kokoro runs on the GPU through lemondate's `kokoro-hip-server.exe`, which links against lemondate's copy of ttscpp (originally from `LostRuins/koboldcpp/otherarch/ttscpp/`, not upstream ttscpp — the koboldcpp copy has Kokoro support; vanilla ttscpp is hardcoded `cpu_only=true` for all its TTS architectures). Getting Kokoro itself onto HIP took four upstream bugs and two optimisations:
 
 **Bugs that had to be fixed before a single kernel would launch:**
 
@@ -419,9 +360,9 @@ What's patched in `CMakeLists.txt` (in our fork):
 
 **Runtime knobs the shim sets:**
 
-- `GGML_CUDA_FORCE_MMQ=1` + `--usecuda normal 0 mmq`. TheRock's rocBLAS for gfx1201 ships with an incomplete Tensile kernel set — without MMQ you get a flood of `Cannot find the function: Cijk_Alik_Bljk_HSS_BH_Bias_HA_S_SAV_UserArgs_…` on every Q4 matmul and the slow rocBLAS fallback path runs instead of MMQ's quantised kernels.
-- `ROCBLAS_USE_HIPBLASLT=1`. Reroutes rocBLAS's F32 matmul path through **hipBLASLt**, which in TheRock 7.x has a *complete* `gfx1201` / `gfx1200` Tensile kernel set in `<rocm>/bin/hipblaslt/library/TensileLibrary_*_gfx1201.co`. rocBLAS on its own is missing those same variants for RDNA 4, so without this env var every F32 `mul_mat` (duration predictor, AdaIN γ/β projections, conv-via-`mul_mat`) paid the lookup-failure-then-generic-fallback cost. Turning it on gave a **~7× speedup end-to-end** on the Kokoro benchmark set (median 2.33 s → 0.35 s, poem 8.18 s → 1.19 s) and flipped HIP from ~2.5× slower than CPU to ~2.5× faster. Same env var is set in `run_lemonade.ps1.tmpl` so whisper's matmul-heavy encoder benefits too.
-- `--ttsgpu`. `koboldcpp.py` maps that to `inputs.gpulayers=999`, which our patched `kokoro_from_file` reads to decide between the HIP path and the (still-functional) CPU path. Set `$env:VOICE_TTS_KOBOLD_CPU=1` before `start_services.ps1` to force the CPU path back on (A/B debugging; `speak.py` still routes to `:13308` via services.json so `stop_services` + `start_services` is sufficient).
+- `GGML_CUDA_FORCE_MMQ=1`. TheRock's rocBLAS for gfx1201 ships with an incomplete Tensile kernel set — without MMQ you get a flood of `Cannot find the function: Cijk_Alik_Bljk_HSS_BH_Bias_HA_S_SAV_UserArgs_…` on every Q4 matmul and the slow rocBLAS fallback path runs instead of MMQ's quantised kernels. Set in `run_lemond.ps1.tmpl` before spawning `lemond.exe` so child `kokoro-hip-server.exe` / `whisper-server.exe` processes inherit it.
+- `ROCBLAS_USE_HIPBLASLT=1`. Reroutes rocBLAS's F32 matmul path through **hipBLASLt**, which in TheRock 7.x has a *complete* `gfx1201` / `gfx1200` Tensile kernel set in `<rocm>/bin/hipblaslt/library/TensileLibrary_*_gfx1201.co`. rocBLAS on its own is missing those same variants for RDNA 4, so without this env var every F32 `mul_mat` (duration predictor, AdaIN γ/β projections, conv-via-`mul_mat`) paid the lookup-failure-then-generic-fallback cost. Turning it on gave a **~7× speedup end-to-end** on the Kokoro benchmark set (median 2.33 s → 0.35 s, poem 8.18 s → 1.19 s) and flipped HIP from ~2.5× slower than CPU to ~2.5× faster. Same env var in `run_lemond.ps1.tmpl` benefits whisper's matmul-heavy encoder too.
+- `LEMONADE_KOKORO_BACKEND=hip` + `LEMONADE_KOKORO_HIP_BIN=<LemondatePath>\bin\kokoro-hip-server.exe` + `LEMONADE_KOKORO_HIP_MODEL=<LemondatePath>\models\Kokoro_no_espeak_Q4.gguf`. lemond's `KokoroServer::load` reads these and spawns the HIP binary as a child process; there is no python launcher between the user request and the ttscpp graph any more. Set `$env:LEMONADE_KOKORO_BACKEND=cpu` before `start_services.ps1` to force lemond's built-in CPU Kokoro back on (A/B debugging; the TTS URL stays `:13305` so `speak.py`'s services.json routing doesn't need to change).
 
 **What's still on CPU** (minor, hence the poem still takes ~1.3 s rather than ~0.8 s):
 
@@ -431,9 +372,9 @@ What's patched in `CMakeLists.txt` (in our fork):
 
 ### Benchmarks (gfx1201 / RX 9070 XT)
 
-Current default (`VOICE_TTS=kobold`, with `ROCBLAS_USE_HIPBLASLT=1`) on the same 6-prompt set (warm):
+Current default (`VOICE_TTS=hip`, with `ROCBLAS_USE_HIPBLASLT=1`) on the same 6-prompt set (warm). Numbers collected on the pre-split `koboldcpp_hipblas.dll`; lemondate's `kokoro-hip-server.exe` uses the same ttscpp graph + patches, so they should carry over 1:1 (A6 of the split plan verifies this).
 
-| Prompt (chars)            | Kobold HIP (default) | F5-TTS (GPU, opt-in) | Kokoro-PyTorch (exp.)     | Kobold CPU (`VOICE_TTS=cpu`) |
+| Prompt (chars)            | HIP Kokoro (default) | F5-TTS (GPU, opt-in) | Kokoro-PyTorch (exp.)     | CPU Kokoro (`VOICE_TTS=cpu`) |
 |---------------------------|---------------------:|---------------------:|--------------------------:|-----------------------------:|
 | short (12)                | **0.10 s**           | ~0.4 s               | ~1.5 s warm / ~15 s cold  | 0.22 s                       |
 | medium (52)               | **0.22 s**           | ~0.6 s               | ~0.8 s warm               | 0.49 s                       |
@@ -446,7 +387,7 @@ Current default (`VOICE_TTS=kobold`, with `ROCBLAS_USE_HIPBLASLT=1`) on the same
 
 HIP is now the fastest backend across the board. For context, before we discovered `ROCBLAS_USE_HIPBLASLT` (which is effectively a one-env-var change to route F32 matmul through hipBLASLt's complete kernel set instead of rocBLAS's incomplete one), the same bench run was:
 
-| Prompt | Kobold HIP (without hipBLASLt) |
+| Prompt | HIP Kokoro (without hipBLASLt) |
 |---|---:|
 | short (12)  | 0.45 s |
 | medium (52) | 1.15 s |
@@ -472,4 +413,4 @@ On Strix Halo (gfx1151) the same hipBLASLt switch should do the same thing — T
 .\installers\uninstall_windows.ps1
 ```
 
-Removes any Task Scheduler entries, `%USERPROFILE%\.claude\plugins\voice\`, and `%LOCALAPPDATA%\voice-plugin\` (including logs and any cached TTS artifacts). `~/.claude/settings.json` is left alone — edit it by hand if you want to drop the permission allowlist and Stop hook entries. The `.venv` and `vendor/` build outputs in the workspace are untouched.
+Removes any Task Scheduler entries (`VoiceLemond`, `VoicePTT`, and legacy `VoiceLemonade` / `VoiceKobold` / `VoiceKokoro`), `%USERPROFILE%\.claude\plugins\voice\`, and `%LOCALAPPDATA%\voice-plugin\` (including logs, rendered shims, and any cached TTS artifacts). `~/.claude/settings.json` is left alone — edit it by hand if you want to drop the permission allowlist and Stop hook entries. The lemondate install tree is untouched.

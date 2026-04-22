@@ -37,24 +37,29 @@ import soundfile as sf
 #      Stop hook in ~/.claude/settings.json: Claude Code runs speak.py
 #      as a subprocess and doesn't inherit env vars from the shell that
 #      ran start_services.ps1, so without this fallback speak.py always
-#      thought the backend was "cpu" and hit lemonade on :13305 even if
-#      the user had VOICE_TTS=kobold running an HIP Kokoro on :13308.
-#   5. "cpu" (lemonade's built-in Kokoro)
+#      thought the backend was "cpu" and hit lemond on :13305 even if
+#      the user had VOICE_TTS=hip running HIP Kokoro internally.
+#   5. "cpu" (lemond's built-in CPU Kokoro)
 #
 # Backend port mapping:
-#   cpu     -> lemonade CPU Kokoro,         :13305/api/v1/audio/speech
-#   kokoro  -> our ROCm PyTorch Kokoro,     :13306/api/v1/audio/speech
-#   f5      -> F5-TTS on GPU,               :13307/api/v1/audio/speech
-#   kobold  -> koboldcpp HIP Kokoro,        :13308/v1/audio/speech   (OpenAI path)
+#   cpu     -> lemond built-in CPU Kokoro,        :13305/api/v1/audio/speech
+#   hip     -> lemond -> kokoro-hip-server.exe,   :13305/api/v1/audio/speech
+#   kokoro  -> our ROCm PyTorch Kokoro,           :13306/api/v1/audio/speech
+#   f5      -> F5-TTS on GPU,                     :13307/api/v1/audio/speech
+#   kobold  -> legacy alias for "hip" from pre-lemondate-split installs
+#              where koboldcpp HIP Kokoro listened on :13308/v1/audio/
+#              speech directly; those installs no longer exist but we
+#              keep the entry in case an old services.json survived.
 #
 # 127.0.0.1 not localhost: Windows resolves ::1 first and the fallback
 # adds ~2s per fresh connection (speak.py is a short-lived subprocess
 # per Claude turn so never benefits from connection reuse).
 _TTS_DEFAULTS = {
     "cpu":    ("http://127.0.0.1:13305", "/api/v1/audio/speech"),
+    "hip":    ("http://127.0.0.1:13305", "/api/v1/audio/speech"),
     "kokoro": ("http://127.0.0.1:13306", "/api/v1/audio/speech"),
     "f5":     ("http://127.0.0.1:13307", "/api/v1/audio/speech"),
-    "kobold": ("http://127.0.0.1:13308", "/v1/audio/speech"),
+    "kobold": ("http://127.0.0.1:13305", "/api/v1/audio/speech"),
 }
 
 

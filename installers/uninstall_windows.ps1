@@ -11,7 +11,7 @@ $ErrorActionPreference = "Continue"
 $PluginDest = Join-Path $env:USERPROFILE ".claude\plugins\voice"
 $DaemonDest = Join-Path $env:LOCALAPPDATA "voice-plugin"
 
-foreach ($name in @("VoiceLemonade", "VoicePTT")) {
+foreach ($name in @("VoiceLemond", "VoiceLemonade", "VoiceKobold", "VoiceKokoro", "VoicePTT")) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if ($task) {
         try { Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue } catch {}

@@ -168,23 +168,6 @@ def speak(msg: str) -> None:
     msg = msg[:MAX_CHARS]
     if len(msg) < 3:
         return
-    audit = os.environ.get("SPEAK_AUDIT_LOG")
-    if audit:
-        try:
-            with open(audit, "a", encoding="utf-8") as fh:
-                # Record the EXACT bytes going to TTS so we can see if
-                # Claude's command-line quoting / eval stripped or
-                # transcoded any characters (em-dash, smart quotes,
-                # etc.) before we handed the message to Kokoro.
-                fh.write(json.dumps({
-                    "endpoint": SPEECH_ENDPOINT,
-                    "model": KOKORO_MODEL,
-                    "voice": KOKORO_VOICE,
-                    "text": msg,
-                    "text_hex": msg.encode("utf-8").hex(),
-                }, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
     r = requests.post(
         SPEECH_ENDPOINT,
         json={

@@ -168,6 +168,23 @@ def speak(msg: str) -> None:
     msg = msg[:MAX_CHARS]
     if len(msg) < 3:
         return
+    audit = os.environ.get("SPEAK_AUDIT_LOG")
+    if audit:
+        try:
+            with open(audit, "a", encoding="utf-8") as fh:
+                # Record the EXACT bytes going to TTS so we can see if
+                # Claude's command-line quoting / eval stripped or
+                # transcoded any characters (em-dash, smart quotes,
+                # etc.) before we handed the message to Kokoro.
+                fh.write(json.dumps({
+                    "endpoint": SPEECH_ENDPOINT,
+                    "model": KOKORO_MODEL,
+                    "voice": KOKORO_VOICE,
+                    "text": msg,
+                    "text_hex": msg.encode("utf-8").hex(),
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
     r = requests.post(
         SPEECH_ENDPOINT,
         json={
@@ -193,7 +210,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.from_hook:
-        raw = sys.stdin.read()
+        # Claude Code pipes the Stop hook payload as UTF-8 JSON on stdin.
+        # On Windows, sys.stdin defaults to the console codepage (usually
+        # cp1252), which mis-decodes em-dash bytes e2 80 94 into "â€" —
+        # the middle byte e2 82 ac is the EURO SIGN, which Kokoro's
+        # REPLACEABLE map pronounces "jˈʊɹɹoʊz" ("euros"). Read raw
+        # bytes and decode as UTF-8 to preserve what Claude actually
+        # sent.
+        raw_bytes = sys.stdin.buffer.read()
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            # Some non-UTF-8 hook payload got through. Fall back to the
+            # default decoder but replace undecodable bytes rather than
+            # crash.
+            raw = raw_bytes.decode("utf-8", errors="replace")
         try:
             payload = json.loads(raw or "{}")
         except Exception:

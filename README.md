@@ -4,7 +4,7 @@ Local STT, wake word, and TTS for [Claude Code](https://docs.claude.com/en/docs/
 
 - **STT (hold-F9 or wake-word) on the GPU** via our ROCm build of whisper.cpp. On a 9070 XT (gfx1201) with Whisper-Large-v3-Turbo, transcribes 37.8 s of speech in ~460 ms steady-state — 80× realtime. Requires a patched Lemonade (our `jam/windows-rocm-whisper` submodule branch) because upstream Lemonade only wires CPU / NPU / Vulkan for whispercpp.
 - **Wake word ("hey halo" by default)** — no custom keyword-spotter. Every energy-gated speech burst gets transcribed by Whisper; the transcript is typed only if it starts with the configured wake phrase. Changing the wake phrase is a single env var.
-- **TTS on the GPU** via our patched koboldcpp HIP build running Kokoro through ttscpp. Pinned to `jammm/koboldcpp jam/gfx1201-hip` with four upstream bug-fixes (128-byte tensor alignment, `reciprocal()` host-pointer hack, direct-`->data` writes in `set_inputs`, shared HIP stream) plus a fused `snake_1d` megakernel and CUDA implementations for the kcpp ttscpp dirtypatch ops. Opt-out to CPU via `VOICE_TTS=cpu` or to F5-TTS via `VOICE_TTS=f5` — see [Switching TTS backends](#switching-tts-backends).
+- **TTS on the GPU** via our patched koboldcpp HIP build running Kokoro through ttscpp. Pinned to `jammm/koboldcpp jam/gfx1201-hip` with four upstream bug-fixes (128-byte tensor alignment, `reciprocal()` host-pointer hack, direct-`->data` writes in `set_inputs`, shared HIP stream) plus a fused `snake_1d` megakernel and CUDA implementations for the kcpp ttscpp dirtypatch ops. On a 9070 XT: **0.10 s short prompt, 1.30 s for a 402-char paragraph, median 0.37 s warm** once `ROCBLAS_USE_HIPBLASLT=1` is set (gives ~7× speedup by routing F32 matmul through hipBLASLt's complete gfx1201 kernel set instead of rocBLAS's incomplete one). Opt-out to CPU via `VOICE_TTS=cpu` or to F5-TTS via `VOICE_TTS=f5` — see [Switching TTS backends](#switching-tts-backends).
 - **F9 push-to-talk** via [pynput](https://pynput.readthedocs.io/).
 - **Focus gated to Claude Code** — F9 and wake only fire when the foreground window hosts a `claude.exe` process (or a terminal that has `claude` running alongside). Transcriptions never accidentally land in the wrong app.
 - **Auto-submit** — the daemon presses Enter after typing the transcription so Claude starts processing the moment you stop talking. Set `PTT_AUTO_SUBMIT=0` to review before sending.
@@ -420,29 +420,43 @@ What's patched in `CMakeLists.txt` (in our fork):
 **Runtime knobs the shim sets:**
 
 - `GGML_CUDA_FORCE_MMQ=1` + `--usecuda normal 0 mmq`. TheRock's rocBLAS for gfx1201 ships with an incomplete Tensile kernel set — without MMQ you get a flood of `Cannot find the function: Cijk_Alik_Bljk_HSS_BH_Bias_HA_S_SAV_UserArgs_…` on every Q4 matmul and the slow rocBLAS fallback path runs instead of MMQ's quantised kernels.
+- `ROCBLAS_USE_HIPBLASLT=1`. Reroutes rocBLAS's F32 matmul path through **hipBLASLt**, which in TheRock 7.x has a *complete* `gfx1201` / `gfx1200` Tensile kernel set in `<rocm>/bin/hipblaslt/library/TensileLibrary_*_gfx1201.co`. rocBLAS on its own is missing those same variants for RDNA 4, so without this env var every F32 `mul_mat` (duration predictor, AdaIN γ/β projections, conv-via-`mul_mat`) paid the lookup-failure-then-generic-fallback cost. Turning it on gave a **~7× speedup end-to-end** on the Kokoro benchmark set (median 2.33 s → 0.35 s, poem 8.18 s → 1.19 s) and flipped HIP from ~2.5× slower than CPU to ~2.5× faster. Same env var is set in `run_lemonade.ps1.tmpl` so whisper's matmul-heavy encoder benefits too.
 - `--ttsgpu`. `koboldcpp.py` maps that to `inputs.gpulayers=999`, which our patched `kokoro_from_file` reads to decide between the HIP path and the (still-functional) CPU path. Set `$env:VOICE_TTS_KOBOLD_CPU=1` before `start_services.ps1` to force the CPU path back on (A/B debugging; `speak.py` still routes to `:13308` via services.json so `stop_services` + `start_services` is sufficient).
 
-**What's NOT on the GPU yet (and is why perf is mixed on gfx1201):**
+**What's still on CPU** (minor, hence the poem still takes ~1.3 s rather than ~0.8 s):
 
-- ggml STFT / iSTFT (`GGML_OP_STFT`, `GGML_OP_ISTFT`, `GGML_OP_AA_*`) are still CPU-only. Every call moves O(audio-length) samples host↔device.
-- F32 matmuls (duration predictor, AdaIN gamma/beta projections, conv-via-`mul_mat`) still hit hipBLAS because `ggml_cuda_should_use_mmf`'s F32 case requires Ampere+ or MFMA (neither gfx1201 nor gfx1150 has MFMA; RDNA 4 has WMMA but the MMF F32 template instantiations don't compile for it — see the commented-out experiment in `mmf.cu`). So every F32 matmul pays the rocBLAS-Tensile-lookup-then-fallback cost.
+- ggml STFT / iSTFT (`GGML_OP_STFT`, `GGML_OP_ISTFT`, `GGML_OP_AA_*`) — kcpp dirtypatch ops with no CUDA impl. Every call in the decoder moves `O(audio-length)` samples host↔device. Implementable on top of hipFFT / rocFFT (which TheRock ships); not done yet.
+- `ggml_upscale_linear` and `ggml_conv_transpose_1d_tts` — two more kcpp dirtypatch ops used by the sin generator / residual blocks. Simple enough to port as CUDA kernels (the latter can probably reuse ggml's stock `GGML_OP_CONV_TRANSPOSE_1D` which already has CUDA).
+- `ggml_map_custom3(uv_noise_compute)` — a CPU-only custom callback inside `build_sin_gen`. Small data, called once per generator block.
 
 ### Benchmarks (gfx1201 / RX 9070 XT)
 
-Current default (`VOICE_TTS=kobold`) vs alternatives on the same 6-prompt set (warm, no first-call inflation):
+Current default (`VOICE_TTS=kobold`, with `ROCBLAS_USE_HIPBLASLT=1`) on the same 6-prompt set (warm):
 
-| Prompt (chars)            | Kobold HIP (default)    | F5-TTS (GPU, opt-in)    | Kokoro-PyTorch (exp.)      | Kobold CPU (`VOICE_TTS=cpu`) |
-|---------------------------|-------------------------|-------------------------|----------------------------|------------------------------|
-| short (12)                | 0.45 s                  | **~0.4 s**              | ~1.5 s warm / ~15 s cold   | 0.59 s                       |
-| medium (52)               | 1.15 s                  | ~0.6 s                  | ~0.8 s warm                | **0.50 s**                   |
-| long (127)                | 2.28 s                  | ~1.3 s                  | ~1.5 s warm                | **0.93 s**                   |
-| poem (402)                | 8.18 s                  | ~2.5 s                  | **14.6 s cold** / ~3.2 s   | **3.16 s**                   |
-| code (128)                | 2.33 s                  | ~1.2 s                  | ~1.5 s warm                | **0.98 s**                   |
-| explain (163)             | 2.97 s                  | ~1.5 s                  | ~1.7 s warm                | **1.26 s**                   |
-| total 6 prompts (warm)    | 17.35 s                 | ~8 s                    | ~62 s (includes warmup)    | **7.48 s**                   |
-| median                    | 2.33 s                  | ~0.9 s                  | ~1.5 s                     | **0.96 s**                   |
+| Prompt (chars)            | Kobold HIP (default) | F5-TTS (GPU, opt-in) | Kokoro-PyTorch (exp.)     | Kobold CPU (`VOICE_TTS=cpu`) |
+|---------------------------|---------------------:|---------------------:|--------------------------:|-----------------------------:|
+| short (12)                | **0.10 s**           | ~0.4 s               | ~1.5 s warm / ~15 s cold  | 0.22 s                       |
+| medium (52)               | **0.22 s**           | ~0.6 s               | ~0.8 s warm               | 0.49 s                       |
+| long (127)                | **0.35 s**           | ~1.3 s               | ~1.5 s warm               | 0.94 s                       |
+| poem (402)                | **1.30 s**           | ~2.5 s               | 14.6 s cold / ~3.2 s warm | 3.37 s                       |
+| code (128)                | **0.37 s**           | ~1.2 s               | ~1.5 s warm               | 0.98 s                       |
+| explain (163)             | **0.47 s**           | ~1.5 s               | ~1.7 s warm               | 1.26 s                       |
+| total 6 prompts (warm)    | **2.80 s**           | ~8 s                 | ~62 s (includes warmup)   | 7.33 s                       |
+| median                    | **0.37 s**           | ~0.9 s               | ~1.5 s                    | 0.98 s                       |
 
-On this dev box (gfx1201 + TheRock 7.x) the HIP default is slower than the CPU fallback because of the two bottlenecks called out above — the rocBLAS Tensile gap alone costs ~5-10× the per-call-kernel-launch overhead. We're defaulting to HIP anyway because (a) the target test platform is Strix Halo (gfx1150 / XDNA2 NPU) where those bottlenecks don't apply the same way, (b) the fix for the rocBLAS gap is upstream to TheRock rather than ours, and (c) if you want the CPU numbers you're one env var away (`$env:VOICE_TTS="cpu"`).
+HIP is now the fastest backend across the board. For context, before we discovered `ROCBLAS_USE_HIPBLASLT` (which is effectively a one-env-var change to route F32 matmul through hipBLASLt's complete kernel set instead of rocBLAS's incomplete one), the same bench run was:
+
+| Prompt | Kobold HIP (without hipBLASLt) |
+|---|---:|
+| short (12)  | 0.45 s |
+| medium (52) | 1.15 s |
+| long (127)  | 2.28 s |
+| poem (402)  | 8.18 s |
+| median      | 2.33 s |
+
+i.e. **~7× slower** across the board and ~2.5× slower than CPU.
+
+On Strix Halo (gfx1150) the same hipBLASLt switch should do the same thing — TheRock ships gfx1150 Tensile libraries too — and there the NPU will also be on the STT side (see [Deploying on Strix Halo](#deploying-on-strix-halo-gfx1150-igpu--xdna2-npu)).
 
 ## Out of scope (v1)
 

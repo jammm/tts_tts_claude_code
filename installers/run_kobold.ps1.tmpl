@@ -30,6 +30,17 @@ $env:ROCM_SDK_BIN = $RocmBin
 # find the function: Cijk_..." cascades. MMQ uses ggml's own quantized-
 # matmul kernels and avoids rocBLAS entirely for the Q4 path.
 $env:GGML_CUDA_FORCE_MMQ = "1"
+# Reroute rocBLAS's F32 matmul path through hipBLASLt (which has a
+# complete gfx1201 / gfx1150 Tensile kernel set in TheRock, unlike
+# rocBLAS itself). Without this, every F32 MUL_MAT in the duration
+# predictor + AdaIN gamma/beta projections + conv-via-mul_mat falls
+# through to rocBLAS's incomplete dispatch and either spins on
+# "Cannot find the function: Cijk_Alik_Bljk_S_..." lookups or runs a
+# slow generic kernel. With it the HIP Kokoro path is ~7x faster end-
+# to-end on gfx1201 (poem 402 chars: 8.18 s -> 1.19 s, median 2.33 s
+# -> 0.35 s) and now ~2-3x faster than the ggml CPU backend across
+# the benchmark set.
+$env:ROCBLAS_USE_HIPBLASLT = "1"
 
 # --usecuda picks koboldcpp_hipblas.dll, mmq forces the matmul path
 # above. --ttsgpu sets inputs.gpulayers=999 which our patched

@@ -28,23 +28,59 @@ import requests
 import sounddevice as sd
 import soundfile as sf
 
-# TTS backend selection mirrors start_services.ps1's VOICE_TTS env var:
-#   cpu     -> lemonade CPU Kokoro, :13305/api/v1/audio/speech   (default)
-#   kokoro  -> our ROCm PyTorch Kokoro, :13306/api/v1/audio/speech
-#   f5      -> F5-TTS on GPU,         :13307/api/v1/audio/speech
-#   kobold  -> koboldcpp HIP Kokoro,  :13308/v1/audio/speech      (OpenAI path)
-# Override with TTS_URL/TTS_SPEECH_PATH/TTS_SPEECH_URL if you're running
-# a non-default port or a different backend. 127.0.0.1 instead of
-# localhost because Windows resolves ::1 first and the fallback adds ~2s
-# per fresh connection (speak.py is a short-lived subprocess per Claude
-# turn so never benefits from connection reuse).
+# TTS backend selection. Priority:
+#   1. TTS_SPEECH_URL env (full URL override)
+#   2. TTS_URL + TTS_SPEECH_PATH env overrides
+#   3. VOICE_TTS env var
+#   4. %LOCALAPPDATA%\voice-plugin\services.json's `tts_backend` field —
+#      what start_services.ps1 actually launched. This matters for the
+#      Stop hook in ~/.claude/settings.json: Claude Code runs speak.py
+#      as a subprocess and doesn't inherit env vars from the shell that
+#      ran start_services.ps1, so without this fallback speak.py always
+#      thought the backend was "cpu" and hit lemonade on :13305 even if
+#      the user had VOICE_TTS=kobold running an HIP Kokoro on :13308.
+#   5. "cpu" (lemonade's built-in Kokoro)
+#
+# Backend port mapping:
+#   cpu     -> lemonade CPU Kokoro,         :13305/api/v1/audio/speech
+#   kokoro  -> our ROCm PyTorch Kokoro,     :13306/api/v1/audio/speech
+#   f5      -> F5-TTS on GPU,               :13307/api/v1/audio/speech
+#   kobold  -> koboldcpp HIP Kokoro,        :13308/v1/audio/speech   (OpenAI path)
+#
+# 127.0.0.1 not localhost: Windows resolves ::1 first and the fallback
+# adds ~2s per fresh connection (speak.py is a short-lived subprocess
+# per Claude turn so never benefits from connection reuse).
 _TTS_DEFAULTS = {
     "cpu":    ("http://127.0.0.1:13305", "/api/v1/audio/speech"),
     "kokoro": ("http://127.0.0.1:13306", "/api/v1/audio/speech"),
     "f5":     ("http://127.0.0.1:13307", "/api/v1/audio/speech"),
     "kobold": ("http://127.0.0.1:13308", "/v1/audio/speech"),
 }
-_VOICE_TTS = (os.environ.get("VOICE_TTS") or "cpu").lower()
+
+
+def _read_services_json_backend() -> str | None:
+    """Return tts_backend from %LOCALAPPDATA%\\voice-plugin\\services.json,
+    or None if the file is missing / unreadable / malformed."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    path = Path(base) / "voice-plugin" / "services.json"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    backend = data.get("tts_backend")
+    if isinstance(backend, str) and backend in _TTS_DEFAULTS:
+        return backend
+    return None
+
+
+_VOICE_TTS = (
+    os.environ.get("VOICE_TTS")
+    or _read_services_json_backend()
+    or "cpu"
+).lower()
 _default_url, _default_path = _TTS_DEFAULTS.get(_VOICE_TTS, _TTS_DEFAULTS["cpu"])
 TTS_URL = os.environ.get("TTS_URL", _default_url)
 TTS_SPEECH_PATH = os.environ.get("TTS_SPEECH_PATH", _default_path)

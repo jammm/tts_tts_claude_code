@@ -55,15 +55,6 @@ if (-not $env:GGML_CUDA_FORCE_MMQ) {
     $env:GGML_CUDA_FORCE_MMQ = "1"
 }
 
-# kokoro-hip-server traps SIGABRT / SIGSEGV / unhandled C++ exceptions
-# and writes a record of the last request + exception reason to this
-# file before the CRT fast-fails us out. Without this, ttscpp's
-# TTS_ABORT path becomes an opaque "CURL error: Couldn't connect to
-# server" in lemond with no clue which input blew up.
-if (-not $env:KOKORO_HIP_CRASH_LOG) {
-    $env:KOKORO_HIP_CRASH_LOG = Join-Path $VoicePluginData "logs\kokoro-hip-crash.log"
-}
-
 # Whisper backend selection. Lemonade's whispercpp recipe supports
 # cpu / vulkan / npu / rocm. "rocm" is our lemondate build (whisper-
 # server.exe built from src/whisper + src/ggml in lemondate). The

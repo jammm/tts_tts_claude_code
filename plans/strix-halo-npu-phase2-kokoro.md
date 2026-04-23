@@ -184,3 +184,64 @@ nothing.
   <https://github.com/adrianlyjak/kokoro-onnx-export>
 - Kokoro canonical CPU ONNX:
   <https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX>
+
+
+---
+
+## Experimental findings (2026-04-23)
+
+Tested on Ryzen AI Max+ 395 (Strix Halo) with NPU driver 32.0.203.329
+and Ryzen AI SDK 1.7.1. All tests used the community Kokoro-82M ONNX
+model (onnx-community/Kokoro-82M-v1.0-ONNX).
+
+### VitisAI EP compilation
+
+The VAIML compiler (Ryzen AI 1.7.1) successfully compiles a
+static-shape (input padded to 128 tokens) FP32 Kokoro ONNX graph for
+the AIE2P target. The full compilation takes ~3 minutes and produces
+an xclbin + partition. However:
+
+**FP32 static model**: AIE compiler runs, produces aiml_par_0, but
+crashes with **access violation (0xC0000005)** during HW context
+creation. The compiled partition is too large or hits an XRT runtime
+bug.
+
+**FP16 static model**: Session creation succeeds (26.7s including
+compile), but the EP report shows **all 2138 nodes on CPU (100%)**
+with a ail_safe_summary.json. The compiler couldn\'t find a valid
+NPU partition.
+
+**Root cause**: Kokoro\'s internal shapes are data-dependent (the
+	orch.repeat_interleave in the duration alignment path produces
+tensors whose sizes depend on predicted durations, which vary per
+utterance). Fixing the ONNX inputs to static shapes is necessary but
+not sufficient — the internal dynamic shapes still prevent the
+VitisAI graph partitioner from offloading to NPU.
+
+### CPU baseline performance
+
+Even without NPU offload, the ONNX model runs at **RTF 0.1 on CPU**
+(0.34s for 3.5s of audio, Zen 5 16-core). This is fast enough for
+real-time TTS but violates the Phase 2 directive of NPU-only.
+
+### SDK quicktest
+
+The SDK\'s own quicktest (	est_model.onnx, a small ResNet) runs
+successfully on the NPU, confirming the SDK + driver + XRT stack
+works. The issue is specific to Kokoro\'s graph complexity.
+
+### Next steps for Phase 2
+
+1. **Model surgery**: split Kokoro into two ONNX subgraphs:
+   - **Encoder + Duration Predictor** (static shapes, no
+     
+epeat_interleave) — this should compile for NPU
+   - **Decoder / iSTFTNet** (takes the predicted frame count as
+     input, not computed internally) — test this separately
+
+2. **Re-export from PyTorch** using drianlyjak/kokoro-onnx-export
+   with modifications to split at the duration-alignment boundary.
+
+3. **File AMD bug** for the FP32 HW context access violation — the
+   compiler produced a valid-looking partition that the runtime
+   couldn\'t load. This may be fixed in Ryzen AI 1.8+.

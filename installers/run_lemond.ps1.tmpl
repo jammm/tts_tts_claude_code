@@ -30,10 +30,32 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Forc
 $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $logFile = Join-Path $LogDir "lemond-$ts.log"
 
-# Prepend lemondate's bin/ so amdhip64 / hipblas / rocblas / ggml-hip /
-# ggml / cpp-httplib DLLs resolve for whisper-server and kokoro-hip-server
-# when lemond spawns them.
-$env:PATH = "$LemondateBin;" + $env:PATH
+# Prepend lemondate's bin/ so ggml / cpp-httplib DLLs resolve for
+# whisper-server and kokoro-hip-server when lemond spawns them.
+# Also prepend the ROCm SDK's bin/ (via `rocm-sdk path --root`) so
+# hipblas / rocblas / rocfft / hiprtc / amdhip64 resolve from the
+# venv's installed ROCm packages rather than from copied DLLs.
+# This avoids version skew when the venv is updated or the target
+# GPU changes (gfx1201 vs gfx1151 ship different ROCm library builds).
+$rocmRoot = $null
+try {
+    $rocmSdk = Get-Command rocm-sdk -ErrorAction SilentlyContinue
+    if (-not $rocmSdk) {
+        $rocmSdk = Get-Item (Join-Path $LemondatePath "venv\Scripts\rocm-sdk.exe") -ErrorAction SilentlyContinue
+    }
+    if ($rocmSdk) {
+        $rocmRoot = & $rocmSdk.FullName path --root 2>$null
+        if ($rocmRoot) { $rocmRoot = $rocmRoot.Trim() }
+    }
+} catch { }
+
+if ($rocmRoot -and (Test-Path "$rocmRoot\bin")) {
+    Write-Host "[lemond] ROCm SDK root: $rocmRoot"
+    $env:PATH = "$LemondateBin;$rocmRoot\bin;" + $env:PATH
+} else {
+    Write-Host "[lemond] rocm-sdk not found; using lemondate bin/ only"
+    $env:PATH = "$LemondateBin;" + $env:PATH
+}
 
 # Route rocBLAS's F32 matmul path through hipBLASLt - TheRock's rocBLAS
 # for gfx1201 / gfx1151 ships with an incomplete Tensile kernel set, but

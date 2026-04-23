@@ -42,6 +42,14 @@ pretrained_models/
 scripts/*.out
 scripts/*.csv
 
+# Local-only remote-ops tooling for the Strix Halo NPU test box.
+# Contains hardcoded creds and is specific to one private machine; keep
+# it out of the repo. Anyone cloning this should follow
+# plans/strix-halo-npu-phase1.md to set up their own deployment
+# locally, not via this tooling.
+scripts/remote_*.py
+scripts/README-strix-halo.md
+
 # OS cruft
 Thumbs.db
 .DS_Store

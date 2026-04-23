@@ -1,4 +1,4 @@
-# Strix Halo deployment — Phase 1 (NPU STT, iGPU TTS)
+# Strix Halo deployment ??? Phase 1 (NPU STT, iGPU TTS)
 
 This guide walks through bringing up `lemondate` on a Ryzen AI Max /
 Max+ ("Strix Halo") laptop or desktop. It covers **Phase 1** of the
@@ -6,15 +6,15 @@ NPU migration:
 
 - **Phase 1 (this doc):** Whisper STT on the XDNA 2 NPU, Kokoro TTS
   on the gfx1151 iGPU. Whisper NPU support is a solved problem in
-  AMD's stack — we just wire Lemonade to it.
+  AMD's stack ??? we just wire Lemonade to it.
 - **Phase 2 (future):** Kokoro TTS on the NPU, iGPU fully freed for
-  LLM / rendering / other workloads. No CPU fallback, no iGPU hack —
+  LLM / rendering / other workloads. No CPU fallback, no iGPU hack ???
   see [`strix-halo-npu-phase2-kokoro.md`](./strix-halo-npu-phase2-kokoro.md) for the port
   plan. Phase 2 starts only after Phase 1 is production-solid.
 
 Strix Halo and Strix Point are the **same software target** in AMD's
 Ryzen AI stack (both reported as "STX" / "XDNA 2"), so everything in
-this doc also applies to Strix Point laptops — just point the GPU
+this doc also applies to Strix Point laptops ??? just point the GPU
 build at the right `gfx####` for your iGPU.
 
 ---
@@ -49,10 +49,10 @@ Test-Path "$env:RYZEN_AI_INSTALLATION_PATH\deployment\onnxruntime.dll"
 ### 2. Install/upgrade the NPU driver
 
 Minimum: **32.0.203.280** (WHQL). Download `NPU_RAI1.5_280_WHQL.zip`
-from AMD, install. Open Task Manager → Performance tab and confirm
+from AMD, install. Open Task Manager ??? Performance tab and confirm
 you see **NPU0** alongside CPU and GPU.
 
-Note: Ryzen AI 1.7 keeps the same driver package as 1.5 — the WHQL
+Note: Ryzen AI 1.7 keeps the same driver package as 1.5 ??? the WHQL
 zip filename still reads `RAI1.5`.
 
 ### 3. Put the NPU in performance mode
@@ -73,7 +73,7 @@ NPU binary links against these at runtime.
 
 ### 5. Install TheRock ROCm SDK (for the iGPU Kokoro path)
 
-Same as the main README — `pip install --index-url
+Same as the main README ??? `pip install --index-url
 https://rocm.nightlies.amd.com/v2/gfx120X-all/ torch
 "rocm[libraries,devel]"` into `d:\jam\demos\.venv\`. The build driver
 uses `_rocm_sdk_devel` under there for `clang.exe` / `hipcc`.
@@ -117,7 +117,7 @@ happens once per `lemondate` checkout.
 If you want lemondate fully self-contained (no runtime downloads on
 a new host), drop a pre-built `amd/whisper.cpp` NPU binary at
 `bin\whisper-server-npu.exe` and set
-`LEMONADE_WHISPERCPP_NPU_BIN` to its path — see the runtime config
+`LEMONADE_WHISPERCPP_NPU_BIN` to its path ??? see the runtime config
 section below.
 
 ---
@@ -161,7 +161,7 @@ First run will trigger:
 3. Kokoro on iGPU loads your local `models\Kokoro_no_espeak_Q4.gguf`
    directly (no download).
 4. First transcription after that triggers Vitis AI's JIT compile of
-   the encoder graph (~10-15 seconds the very first time — the result
+   the encoder graph (~10-15 seconds the very first time ??? the result
    is cached in `%USERPROFILE%\.cache\vitis_ai\`). Subsequent calls
    start instantly.
 
@@ -193,7 +193,7 @@ Switch live-path models by overriding the checkpoint in the
 `WhisperServer` config or via `LEMONADE_WHISPERCPP_MODEL`.
 
 For **Claude Code** usage (short utterances, 1-5 seconds), `base.en`
-on NPU is the sweet spot — live transcription with headroom for the
+on NPU is the sweet spot ??? live transcription with headroom for the
 wake-word listener to also run without contention.
 
 ---
@@ -224,12 +224,12 @@ NPU STT + iGPU TTS is the correct division of labour.
 
 `system_info.cpp` in `lemond` didn't find an XDNA 2 NPU. Check:
 
-1. Device Manager → System devices → you should see "NPU Compute
+1. Device Manager ??? System devices ??? you should see "NPU Compute
    Accelerator Device" driven by `amdxdnanpu.sys` (or similar).
 2. The driver version should be >= 32.0.203.280.
 3. Task Manager should show NPU0 under Performance.
 
-If all three are fine, check the lemond log for the specific error —
+If all three are fine, check the lemond log for the specific error ???
 it distinguishes "driver not found" from "architecture is XDNA 1"
 (Phoenix / Hawk Point) vs "architecture is XDNA 2" (Strix / Strix
 Halo / Krackan).
@@ -244,7 +244,7 @@ after `start_services.ps1`.
 
 ### Kokoro iGPU crashes with "invalid configuration argument"
 
-Would be surprising — we explicitly fixed this (see the STFT-tile
+Would be surprising ??? we explicitly fixed this (see the STFT-tile
 commit 85ca078 for details). If you hit this on Strix Halo, capture
 `%LOCALAPPDATA%\voice-plugin\logs\kokoro-hip-crash.log` and the
 matching `kokoro-hip-*.dmp` for post-mortem.
@@ -263,5 +263,5 @@ have the `-lt-` variant.
 #   2. NPU driver loaded and device enumerated
 #   3. FlexML runtime DLLs on PATH
 #   4. NPU is in performance pmode
-D:\jam\lemondate\scripts\detect_npu.ps1
+lemondate\scripts\detect_npu.ps1
 ```

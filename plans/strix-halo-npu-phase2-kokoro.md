@@ -1,11 +1,11 @@
-# Phase 2 ΓÇö Kokoro TTS on the Strix Halo XDNA 2 NPU
+# Phase 2 ??? Kokoro TTS on the Strix Halo XDNA 2 NPU
 
 **Status (2026-04-23): not supported yet. Phase 1 (Whisper STT on
 NPU, see [strix-halo-npu-phase1.md](./strix-halo-npu-phase1.md)) ships first. Only once
 that is solid do we start this work.**
 
 Phase 2 goal: full NPU offload of Kokoro-82M. No CPU fallback on
-hot paths, no iGPU co-execution ΓÇö a single NPU-resident graph end
+hot paths, no iGPU co-execution ??? a single NPU-resident graph end
 to end. Strix Halo's iGPU then stays completely free for whatever
 LLM / rendering / other work wants it.
 
@@ -28,7 +28,7 @@ Unlike Whisper, Kokoro has **zero upstream precedent** on XDNA 2:
   `config.json` has `"kokoro": { "cpu_bin": "builtin" }` (compare to
   `whispercpp` which has both `cpu_bin` and `npu_bin`).
 
-Kokoro-82M is StyleTTS2 distilled ΓÇö encoder + prosody predictor +
+Kokoro-82M is StyleTTS2 distilled ??? encoder + prosody predictor +
 ISTFTNet decoder. The iSTFTNet decoder's `ConvTranspose1d` + custom
 `STFT`/`iSTFT` tail is the awkward bit: it's perfectly fine on CPU
 and CUDA, but it broke DirectML for other teams
@@ -56,7 +56,7 @@ graph through Vitis AI's graph partitioner yet.
 
 ## Concrete port plan (3-5 weeks)
 
-### Week 1 ΓÇö static-shape ONNX export
+### Week 1 ??? static-shape ONNX export
 
 The stock `torch.onnx.export` of Kokoro produces a dynamic-shape
 graph (phoneme count, style dim, output length are all symbolic).
@@ -74,10 +74,10 @@ Export separate static-shape models for:
 
 Starter scripts to fork:
 [`adrianlyjak/kokoro-onnx-export`](https://github.com/adrianlyjak/kokoro-onnx-export)
-ΓÇö has a good per-node impact-analysis tool (`trial-quantization`)
+??? has a good per-node impact-analysis tool (`trial-quantization`)
 that's useful for step 2.
 
-### Week 2 ΓÇö Quark BFP16 quantization
+### Week 2 ??? Quark BFP16 quantization
 
 Run each static ONNX through AMD Quark 0.11.1 with `BFP16Spec`
 using a ~50-utterance calibration set (phonemized English from
@@ -95,24 +95,24 @@ If any op falls back, iterate:
   ops the EP doesn't fuse; replacing with manual DFT math can fix
   it.
 - If an op genuinely can't run on NPU, keep it on CPU via EP
-  partitioning ΓÇö acceptable as long as the per-request overhead
+  partitioning ??? acceptable as long as the per-request overhead
   stays under ~30ms.
 
-### Week 3 ΓÇö quality validation
+### Week 3 ??? quality validation
 
 Compare waveform output against CPU reference on a 50-utterance
 test set. Measure:
 
 - **PESQ** (should be >3.5 vs CPU BFP16 oracle)
 - **Mean Opinion Score** via a small listener panel (or CER via
-  Whisper round-trip ΓÇö if Whisper on the CPU-Kokoro output transcribes
+  Whisper round-trip ??? if Whisper on the CPU-Kokoro output transcribes
   identically to Whisper on the NPU-Kokoro output, that's a strong
   signal)
 
-Re-quantize any problem ops at higher precision (A16W8 ΓåÆ BF16)
+Re-quantize any problem ops at higher precision (A16W8 ??? BF16)
 as needed.
 
-### Week 4 ΓÇö productionize
+### Week 4 ??? productionize
 
 - Pre-computed `.rai` cache per voice (Kokoro has ~60 voices, so
   this is ~60 small cache files). Ship them as a HF repo.
@@ -122,7 +122,7 @@ as needed.
   which exercises the EP's small-batch path. Verify no unexpected
   overhead vs batched inference.
 
-### Week 5 ΓÇö ship and monitor
+### Week 5 ??? ship and monitor
 
 - Add `LEMONADE_KOKORO_BACKEND=npu` wiring in `run_lemond.ps1.tmpl`
   mirroring the existing `hip`/`cpu` paths.
@@ -149,7 +149,7 @@ this doc is planning material, not a task list.
 
 ---
 
-## Full NPU offload only ΓÇö no partial port, no iGPU fallback
+## Full NPU offload only ??? no partial port, no iGPU fallback
 
 The architectural directive is explicit: Kokoro must run **entirely
 on the NPU** once Phase 2 ships. No "NPU encoder + CPU decoder" hack,
@@ -161,7 +161,7 @@ That means every op in Kokoro's graph must run on the XDNA 2 NPU
 via the Vitis AI EP, or there's a graph-level replacement that does.
 The known awkward bits (`ConvTranspose1d`, `STFT`/`iSTFT`) all have
 Vitis AI BF16 support on paper, so this is a tractable engineering
-problem ΓÇö just not a cheap one.
+problem ??? just not a cheap one.
 
 If we hit a genuine op gap that can't be lowered or replaced, we
 stop and reopen the design rather than silently fall back. Falling

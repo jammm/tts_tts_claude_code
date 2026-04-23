@@ -38,6 +38,10 @@ pretrained_models/
 # Logs
 *.log
 
+# Local stress-test / monitor / sweep output
+scripts/*.out
+scripts/*.csv
+
 # OS cruft
 Thumbs.db
 .DS_Store
